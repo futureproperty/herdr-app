@@ -3510,6 +3510,11 @@ impl AppWindow {
                 t.view.update(cx, |view, cx| view.open_search(window, cx));
                 return;
             }
+            "terminal.clear" => {
+                let Some(t) = self.focused_terminal(window, cx) else { return self.fail("no focused terminal to clear") };
+                t.view.update(cx, |view, cx| view.clear_buffer(cx));
+                return;
+            }
             "terminal.copy" | "terminal.paste" | "terminal.paste_image" => {
                 if let Some(t) = self.focused_terminal(window, cx) {
                     t.view.update(cx, |v, cx| match name {

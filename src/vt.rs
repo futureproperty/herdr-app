@@ -2171,6 +2171,15 @@ mod tests {
     }
 
     #[test]
+    fn clear_buffer_drops_the_scrollback_the_way_iterm_does() {
+        let mut vt = Vt::new(40, 5);
+        for n in 0..200 { vt.write(format!("line {n}\n").as_bytes()); }
+        assert!(vt.scrollbar().total > vt.scrollbar().len);
+        vt.write(b"\x1b[3J\x1b[H\x1b[2J");
+        assert_eq!(vt.scrollbar().total, vt.scrollbar().len, "no scrollback left");
+    }
+
+    #[test]
     fn vs16_makes_an_emoji_two_cells_wide() {
         let mut vt = Vt::new(10, 2);
         vt.write("\u{270d}\u{fe0f}!\x1bc\u{270d}\u{fe0f}!".as_bytes());
