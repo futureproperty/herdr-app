@@ -1108,13 +1108,12 @@ impl TerminalView {
     /// Clears the screen and scrollback Herdr draws, as iTerm2's Clear Buffer.
     /// The program keeps running and knows nothing of it.
     pub fn clear_buffer(&mut self, cx: &mut Context<Self>) {
-        let alt = self.grid.borrow().vt.alt_screen();
-        self.grid.borrow_mut().vt.write(b"\x1b[3J\x1b[H\x1b[2J");
-        // A shell redraws its prompt as Ctrl+L; a full-screen program on the
-        // alternate screen gets nothing more, as rex's Clear doesn't reach TUIs.
-        if !alt {
-            self.send(b"\x0c");
+        // A full-screen program owns its screen: as rex, cmd-k does nothing there.
+        if self.grid.borrow().vt.alt_screen() {
+            return;
         }
+        self.grid.borrow_mut().vt.write(b"\x1b[3J\x1b[H\x1b[2J");
+        self.send(b"\x0c");
         cx.notify();
     }
 

@@ -56,6 +56,8 @@ pub const COMMANDS: &[Command] = &[
     cmd("tab.unsettle", &[opt("id")], "Bring a settled tab back to the lists."),
     cmd("tab.next", &[], "Show the next tab."),
     cmd("tab.prev", &[], "Show the previous tab."),
+    cmd("tab.next_all", &[], "Show the next tab across spaces, in space order."),
+    cmd("tab.prev_all", &[], "Show the previous tab across spaces, in space order."),
     cmd("pane.zoom", &[opt("pane")], "Show only this pane of its tab, or all again."),
     cmd("pane.rename", &[opt("pane"), opt("name")], "Name a pane (default: the focused one; asks the person when no name; an empty name: unnamed again)."),
     cmd("pane.focus", &[opt("pane"), opt("terminal")], "Focus a pane (or the pane showing a terminal)."),

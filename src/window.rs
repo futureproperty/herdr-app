@@ -3322,6 +3322,9 @@ impl AppWindow {
                     }
                 }
             }
+            "tab.next_all" | "tab.prev_all" => {
+                self.model.step_tab_all(if name == "tab.next_all" { 1 } else { -1 });
+            }
             // ---- panes
             "pane.split" => {
                 let axis = match Self::arg(a, "direction") {
