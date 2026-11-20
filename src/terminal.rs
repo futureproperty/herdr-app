@@ -22,6 +22,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 const OUTPUT_TIME_PER_TURN: Duration = Duration::from_millis(6);
+const SEARCH_POLL_MS: u64 = 33;
 
 fn output_turn(
     first: Stream,
@@ -195,22 +196,11 @@ pub struct TerminalView {
     _reader: Option<Task<()>>,
 }
 
-thread_local! {
-    /// Terminals with output waiting for the next tick of the output clock.
-    static OUTPUT_CLOCK: RefCell<Vec<WeakEntity<TerminalView>>> = const { RefCell::new(Vec::new()) };
-}
-
 /// The window's frame number, counted where the window renders.
 static FRAME: AtomicU64 = AtomicU64::new(0);
 
 pub fn next_frame() {
     FRAME.fetch_add(1, Ordering::Relaxed);
-}
-
-pub fn flush_output_clock(cx: &mut gpui::App) {
-    for view in OUTPUT_CLOCK.with(|c| std::mem::take(&mut *c.borrow_mut())) {
-        let _ = view.update(cx, |_, cx| cx.notify());
-    }
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
@@ -630,28 +620,10 @@ impl TerminalView {
         open
     }
 
-    /// Output is drawn on a shared clock (~30 a second), so panes printing
-    /// out of step share window frames; right after typing, at once.
+    /// Output is drawn at once: GPUI draws at most one frame per display refresh,
+    /// so a burst of output still shares one frame without waiting for a clock.
     fn redraw_soon(&self, cx: &mut Context<Self>) {
-        if self.typed_at.get().is_some_and(|t| t.elapsed() < Duration::from_millis(200)) {
-            cx.notify();
-            return;
-        }
-        let me = cx.entity().downgrade();
-        let start = OUTPUT_CLOCK.with(|c| {
-            let mut c = c.borrow_mut();
-            if !c.iter().any(|w| w.entity_id() == me.entity_id()) {
-                c.push(me);
-            }
-            c.len() == 1
-        });
-        if start {
-            cx.spawn(async |_, cx| {
-                cx.background_executor().timer(Duration::from_millis(33)).await;
-                cx.update(flush_output_clock);
-            })
-            .detach();
-        }
+        cx.notify();
     }
 
     /// The window puts this terminal on screen in the frame it's building.
@@ -1006,7 +978,7 @@ impl TerminalView {
                     this.publish_scroll_if_changed(cx);
                     cx.notify();
                 }
-                Some(if busy { Duration::from_millis(33) } else { Duration::from_millis(200) })
+                Some(if busy { Duration::from_millis(SEARCH_POLL_MS) } else { Duration::from_millis(200) })
             }).unwrap_or(None);
             let Some(delay) = delay else { break };
             cx.background_executor().timer(delay).await;
@@ -5016,38 +4988,4 @@ mod tests {
         assert_eq!(pages_to_lines(0.02, 24), 0);
     }
 
-    #[gpui::test]
-    fn flush_output_clock_notifies_pending_terminals_before_the_33ms_timer(cx: &mut gpui::TestAppContext) {
-        use gpui::*;
-        use std::cell::Cell;
-        use std::rc::Rc;
-        use std::time::Duration;
-
-        let terminal = cx.new(|cx| super::TerminalView::attach(crate::hc::offline(), "t1".into(), (40, 5), cx));
-        let notifies = Rc::new(Cell::new(0usize));
-        let _sub = cx.update(|cx| {
-            cx.observe(&terminal, {
-                let notifies = notifies.clone();
-                move |_, _| {
-                    notifies.set(notifies.get() + 1);
-                }
-            })
-        });
-        cx.run_until_parked();
-        notifies.set(0);
-
-        terminal.update(cx, |terminal, cx| {
-            terminal.mark_shown();
-            assert!(terminal.ingest([crate::hc::Stream::Data(b"hello output\r\n".to_vec())], cx));
-        });
-        assert_eq!(notifies.get(), 0, "output clock batches notifications until 33ms elapses");
-
-        cx.update(super::flush_output_clock);
-        cx.run_until_parked();
-        assert_eq!(notifies.get(), 1, "flushing output clock must notify immediately before 33ms");
-
-        cx.executor().advance_clock(Duration::from_millis(33));
-        cx.run_until_parked();
-        assert_eq!(notifies.get(), 1, "subsequent 33ms tick must not emit a duplicate notification");
-    }
 }
