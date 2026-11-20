@@ -155,6 +155,10 @@ struct Grid {
 pub struct TerminalView {
     pub address: String,
     pub title: String,
+    pub hold: bool,
+    pub freeze: bool,
+    pub(crate) locked_at: Option<Instant>,
+    told: Option<(u16, u16)>,
     pub ended: Option<String>,
     /// The core connection dropped; waiting to reattach.
     pub lost: bool,
@@ -250,26 +254,6 @@ impl Grid {
         }
     }
 
-    /// Sizes the screen to `cols` x `rows` of `cell` at `scale`; the program hears of a change.
-    fn fit(&mut self, cols: u16, rows: u16, cell: Size<Pixels>, scale: f32) {
-        self.cell = cell;
-        self.scale = scale;
-        let dev = device_cell(cell, scale);
-        // Before the size, so a program woken by it asks for the new cell.
-        self.refresh_theme(&vt::theme(), dev);
-        self.ready_to_attach();
-        if (cols, rows) == (self.vt.cols, self.vt.rows) && dev == self.vt_cell {
-            return;
-        }
-        self.vt.resize(cols, rows, dev.0, dev.1);
-        self.vt_cell = dev;
-        if let Some(chan) = self.channel {
-            self.core.resize(chan, cols, rows);
-            // Mode 2048 programs wait for this report, not SIGWINCH.
-            let replies = self.vt.take_replies();
-            self.core.automatic_input(chan, &replies);
-        }
-    }
 }
 
 /// A cell in device pixels.
@@ -301,6 +285,10 @@ impl TerminalView {
         let mut view = TerminalView {
             address: address.clone(),
             title: address.clone(),
+            hold: false,
+            freeze: false,
+            locked_at: None,
+            told: None,
             ended: None,
             lost: false,
             selecting: false,
@@ -376,6 +364,7 @@ impl TerminalView {
     /// take seconds, and the window must keep drawing meanwhile.
     fn connect(&mut self, core: Arc<Core>, cx: &mut Context<Self>) {
         self._render_hold = None;
+        self.told = None;
         let fit_ready = {
             let mut g = self.grid.borrow_mut();
             let (cols, rows) = (g.vt.cols, g.vt.rows);
@@ -648,8 +637,70 @@ impl TerminalView {
     }
 
     /// Sizes a terminal that isn't on screen as its pane would be (`AppWindow::fit_hidden_tabs`).
-    pub fn fit(&self, cols: u16, rows: u16, cell: Size<Pixels>, scale: f32) {
-        self.grid.borrow_mut().fit(cols, rows, cell, scale);
+    pub fn fit(&mut self, cols: u16, rows: u16, cell: Size<Pixels>, scale: f32) {
+        // A pane too small to read keeps the program's last size: telling it 2 columns
+        // makes programs print wrapped output that stays in their scrollback.
+        if cols < 12 || rows < 3 {
+            return;
+        }
+        // A slide holds a pane for 240 ms; anything much older is a release that
+        // never came. Without this the grid would stay at an old size while the
+        // program drew at the new one.
+        if self.locked_at.is_some_and(|t| t.elapsed() > Duration::from_millis(2000)) {
+            self.freeze = false;
+            self.hold = false;
+            self.locked_at = None;
+        }
+        if self.freeze {
+            self.tell_size(cols, rows);
+            return;
+        }
+        let same = {
+            let mut g = self.grid.borrow_mut();
+            g.cell = cell;
+            g.scale = scale;
+            let dev = device_cell(cell, scale);
+            // Before the size, so a program woken by it asks for the new cell.
+            g.refresh_theme(&vt::theme(), dev);
+            g.ready_to_attach();
+            if (cols, rows) == (g.vt.cols, g.vt.rows) && dev == g.vt_cell {
+                true
+            } else {
+                g.vt.resize(cols, rows, dev.0, dev.1);
+                g.vt_cell = dev;
+                false
+            }
+        };
+        if same {
+            self.tell_size(cols, rows);
+            return;
+        }
+        self.tell_size(cols, rows);
+    }
+
+    pub(crate) fn settle(&mut self, cols: u16, rows: u16, cell: Size<Pixels>, scale: f32) {
+        self.hold = false;
+        self.freeze = false;
+        self.locked_at = None;
+        self.fit(cols, rows, cell, scale);
+    }
+
+    pub(crate) fn forget_size(&mut self) {
+        self.told = None;
+    }
+
+    fn tell_size(&mut self, cols: u16, rows: u16) {
+        if self.hold || self.told == Some((cols, rows)) {
+            return;
+        }
+        self.told = Some((cols, rows));
+        let mut g = self.grid.borrow_mut();
+        if let Some(chan) = g.channel {
+            g.core.resize(chan, cols, rows);
+            // Mode 2048 programs wait for this report, not SIGWINCH.
+            let replies = g.vt.take_replies();
+            g.core.automatic_input(chan, &replies);
+        }
     }
 
     /// The background the terminal itself shows (a program may set its own).
@@ -2549,7 +2600,7 @@ impl Render for TerminalView {
         let (link, spans) = found.unzip();
         self.link = link;
         self.grid.borrow_mut().link_spans = spans.unwrap_or_default();
-        let grid = self.grid.clone();
+        let fit_view = cx.entity().downgrade();
         let grid_paint = self.grid.clone();
         let selection_view = cx.entity().downgrade();
         let (input_focus, input_view) = (self.focus.clone(), cx.entity());
@@ -2691,9 +2742,10 @@ impl Render for TerminalView {
             }))
             .child(
                 canvas(
-                    move |bounds, window, _cx| {
+                    move |bounds, window, cx| {
                         let (cols, rows) = grid_size(bounds.size, cell);
-                        grid.borrow_mut().fit(cols, rows, cell, window.scale_factor());
+                        let scale = window.scale_factor();
+                        let _ = fit_view.update(cx, |view, _| view.fit(cols, rows, cell, scale));
                     },
                     move |bounds, _, window, cx| {
                         paint_grid(bounds, &grid_paint, focused, &selection_view, window, cx);
@@ -3014,6 +3066,42 @@ mod tests {
         terminal.read_with(cx, |terminal, _| {
             assert!(terminal.lost, "the fitted pane must attempt to attach");
             assert_eq!(terminal.dimensions(), (114, 30));
+        });
+    }
+
+    #[gpui::test]
+    fn a_degenerate_size_keeps_the_program_size(cx: &mut gpui::TestAppContext) {
+        use gpui::*;
+
+        let terminal = cx.new(|cx| super::TerminalView::attach(crate::hc::offline(), "t1".into(), (120, 40), cx));
+        cx.run_until_parked();
+        terminal.update(cx, |terminal, _| terminal.fit(114, 30, size(px(8.), px(18.)), 1.));
+        let before = terminal.read_with(cx, |terminal, _| (terminal.dimensions(), terminal.told));
+        terminal.update(cx, |terminal, _| terminal.fit(2, 1, size(px(8.), px(18.)), 1.));
+        terminal.read_with(cx, |terminal, _| {
+            assert_eq!(terminal.dimensions(), (114, 30));
+            assert_eq!(terminal.told, before.1);
+            assert_eq!(terminal.told, Some((114, 30)));
+        });
+    }
+
+    #[gpui::test]
+    fn a_locked_pane_thaws_after_two_seconds_not_four_hundred_ms(cx: &mut gpui::TestAppContext) {
+        use gpui::*;
+        use std::time::{Duration, Instant};
+
+        let terminal = cx.new(|cx| super::TerminalView::attach(crate::hc::offline(), "t1".into(), (120, 40), cx));
+        cx.run_until_parked();
+        terminal.update(cx, |terminal, _| {
+            terminal.hold = true;
+            terminal.freeze = true;
+            terminal.locked_at = Some(Instant::now() - Duration::from_millis(400));
+            terminal.fit(114, 30, size(px(8.), px(18.)), 1.);
+            assert!(terminal.hold && terminal.freeze && terminal.locked_at.is_some(), "a four-hundred-ms-old lock must still hold");
+
+            terminal.locked_at = Some(Instant::now() - Duration::from_millis(2001));
+            terminal.fit(114, 30, size(px(8.), px(18.)), 1.);
+            assert!(!terminal.hold && !terminal.freeze && terminal.locked_at.is_none(), "a two-second-old lock must clear hold and freeze");
         });
     }
 

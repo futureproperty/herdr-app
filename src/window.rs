@@ -390,6 +390,17 @@ struct Watched {
     programs: Option<SystemTime>,
 }
 
+#[derive(Clone)]
+enum SlideTarget {
+    Weight { id: String, from: f32, to: f32 },
+    Px { id: String, from: f32, to: f32 },
+}
+
+struct ActiveSlide {
+    id: u64,
+    finish: Option<Box<dyn FnOnce(&mut AppWindow, &mut Context<AppWindow>)>>,
+}
+
 pub struct AppWindow {
     core: Arc<Core>,
     runtime: Option<Rc<ShellRuntime>>,
@@ -423,6 +434,9 @@ pub struct AppWindow {
     model: Model,
     /// Terminal views by block id (panes and chrome terminal blocks).
     terms: HashMap<String, Term>,
+    active_slides: HashMap<String, ActiveSlide>,
+    next_slide_id: u64,
+    saved_px: HashMap<String, f32>,
     /// Mod copies by slot (block id, `<stack>#header`, or `overlay:<id>`).
     copies: HashMap<String, Copy>,
     overlays: Vec<Overlay>,
@@ -473,9 +487,12 @@ pub struct AppWindow {
     documents_watching: bool,
     draining: bool,
     changing_terminals: HashSet<String>,
+    /// Panes a slide is closing: a program ending is news every tick until the slide is done.
+    closing_panes: HashSet<String>,
     /// Closed terminals stay excluded until kill completes and a listing drops them.
     closing_terminals: HashMap<String, bool>,
     pending_terminals: std::collections::BTreeMap<String, PendingTerminalChange>,
+    pending_split: Option<String>,
     /// Each machine owns a document; the empty key is this core.
     documents: std::collections::BTreeMap<String, crate::mirror_sync::Slot>,
     initial_view: Option<crate::mirror::View>,
@@ -552,6 +569,9 @@ impl AppWindow {
             float_leave: HashMap::new(),
             model: Model::default(),
             terms: HashMap::new(),
+            active_slides: HashMap::new(),
+            next_slide_id: 1,
+            saved_px: HashMap::new(),
             copies: HashMap::new(),
             overlays: Vec::new(),
             toast_scroll: ScrollHandle::new(),
@@ -586,8 +606,10 @@ impl AppWindow {
             documents_watching: false,
             draining: false,
             changing_terminals: HashSet::new(),
+            closing_panes: HashSet::new(),
             closing_terminals: HashMap::new(),
             pending_terminals: Default::default(),
+            pending_split: None,
             documents: {
                 let mut local = crate::mirror_sync::Slot::default();
                 local.connection(true, None, None);
@@ -1084,13 +1106,17 @@ impl AppWindow {
                 }
             }
         };
+        let other = next != self.layout_name;
+        self.finish_all_slides(cx);
         self.save();
+        if other {
+            self.saved_px.clear();
+        }
         self.float_drag = None;
         self.pane_drag = None;
         self.float_anims.clear();
         self.float_reveal.clear();
         self.float_hover.clear();
-        let other = next != self.layout_name;
         if other {
             self.close_windows(window, cx);
             self.drop_layout_copies(window, cx);
@@ -1171,6 +1197,10 @@ impl AppWindow {
             return;
         }
         self.note_pane_folders();
+        if self.has_chrome_slide() {
+            self.save_view();
+            return;
+        }
         let mut state = layout_sync::State::between(&self.file_chrome, &self.chrome);
         state.theme = self.picked_theme.clone();
         if self.layout_file_ok {
@@ -1546,6 +1576,10 @@ impl AppWindow {
         self.enroll_link_handlers();
         self.refresh_link_handlers();
         self.model.order_spaces();
+        let gone: Vec<String> = self.closing_panes.iter().filter(|p| self.model.tab_of(p).is_none()).cloned().collect();
+        for p in &gone {
+            self.closing_panes.remove(p);
+        }
         let (model, live) = (&self.model, &self.live);
         self.swapped.retain(|p, a| model.address_of(p).is_some() && live.contains_key(a));
         let (mut terms, mods_visible) = self.visible();
@@ -2588,7 +2622,7 @@ impl AppWindow {
                 return self.sync(window, cx);
             }
             if closed && self.model.address_of(block).as_deref() == Some(t.address.as_str()) {
-                self.model.remove_pane(block);
+                self.close_pane_on_its_own(block, window, cx);
                 return self.sync(window, cx);
             }
         }
@@ -2790,10 +2824,484 @@ impl AppWindow {
         root.split(&target, axis, Node::block(new.clone(), Content::Terminal { terminal: String::new() }), "initial-size".into());
         let size = self.model.active_tab().filter(|tab| tab.id == ctx)
             .and_then(|_| self.initial_size(&root, &new, window));
+        let size = size.filter(|&(c, r)| c >= 12 && r >= 3).or_else(|| {
+            self.model.tab(&ctx).and_then(|t| self.shown_size(t, &new, window)).filter(|&(c, r)| c >= 12 && r >= 3)
+        });
         let argv = argv.filter(|a| !a.is_empty()).map(|a| Self::split_argv(a, on.as_deref()));
         let (addr, _) = self.spawn(argv, false, cwd, follow, &space, &ctx, on.as_deref(), size, window)?;
         self.model.split(&target, axis, &new, &addr);
         Ok(json!({ "pane": new, "terminal": addr }))
+    }
+
+    /// The share of `pane` in each container up to the tab root: (node id, current weight).
+    fn share_chain(&self, pane: &str) -> Vec<(String, f32)> {
+        let Some(c) = self.model.tab_of(pane) else { return Vec::new() };
+        let mut chain = Vec::new();
+        let mut id = pane.to_owned();
+        while let Some(parent) = c.root.parent_of(&id) {
+            let weight = match c.root.find(&id).and_then(|n| n.size) {
+                Some(Span::Weight { weight }) => weight,
+                Some(Span::Px { .. }) => 1.0,
+                None => 1.0,
+            };
+            chain.push((id.clone(), weight));
+            id = parent.id.clone();
+        }
+        chain
+    }
+
+    /// Keeps a slide's terminals out of resize until it ends, so each program hears one size.
+    fn set_panes_lock(&mut self, ids: &[String], freeze: &HashSet<String>, forget: &HashSet<String>, hold: bool, cx: &mut Context<Self>) {
+        for id in ids {
+            if let Some(t) = self.terms.get(id) {
+                let view = t.view.clone();
+                let is_frozen = hold && freeze.contains(id);
+                let should_forget = !hold && forget.contains(id);
+                view.update(cx, |v, cx| {
+                    v.hold = hold;
+                    v.freeze = is_frozen;
+                    v.locked_at = hold.then(Instant::now);
+                    if should_forget {
+                        v.forget_size();
+                    }
+                    cx.notify();
+                });
+            }
+        }
+    }
+
+    fn finish_slide(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        let Some(mut slide) = self.active_slides.remove(key) else { return false };
+        if let Some(finish) = slide.finish.take() {
+            finish(self, cx);
+        }
+        true
+    }
+
+    fn finish_all_slides(&mut self, cx: &mut Context<Self>) {
+        let keys: Vec<String> = self.active_slides.keys().cloned().collect();
+        for key in keys {
+            self.finish_slide(&key, cx);
+        }
+    }
+
+    fn has_chrome_slide(&self) -> bool {
+        self.active_slides.keys().any(|key| key.starts_with("chrome:"))
+    }
+
+    fn settle_panes(&self, sizes: &[(String, (u16, u16))], window: &Window, cx: &mut Context<Self>) -> HashSet<String> {
+        let cell = crate::terminal::cell_size(window);
+        let scale = window.scale_factor();
+        let mut settled = HashSet::new();
+        for (id, (cols, rows)) in sizes {
+            if let Some(t) = self.terms.get(id) {
+                t.view.update(cx, |v, _| v.settle(*cols, *rows, cell, scale));
+                settled.insert(id.clone());
+            }
+        }
+        settled
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_slide(
+        &mut self,
+        key: String,
+        targets: Vec<SlideTarget>,
+        held_ids: Vec<String>,
+        freeze: HashSet<String>,
+        forget: HashSet<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        on_done: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+    ) {
+        self.finish_slide(&key, cx);
+        self.set_panes_lock(&held_ids, &freeze, &forget, true, cx);
+        let slide_id = self.next_slide_id;
+        self.next_slide_id += 1;
+        let finish_targets = targets.clone();
+        let finish_held = held_ids.clone();
+        let finish_forget = forget.clone();
+        let finish = move |this: &mut AppWindow, cx: &mut Context<AppWindow>| {
+            for target in finish_targets {
+                match target {
+                    SlideTarget::Weight { id, to, .. } => {
+                        if let Some(n) = this.find_node_mut(&id) {
+                            n.size = Some(Span::Weight { weight: to });
+                        }
+                    }
+                    SlideTarget::Px { id, to, .. } => {
+                        if let Some(n) = this.find_node_mut(&id) {
+                            n.size = Some(Span::Px { px: to });
+                        }
+                    }
+                }
+            }
+            on_done(this, cx);
+            this.set_panes_lock(&finish_held, &HashSet::new(), &finish_forget, false, cx);
+        };
+        self.active_slides.insert(key.clone(), ActiveSlide { id: slide_id, finish: Some(Box::new(finish)) });
+        let has_px = targets.iter().any(|t| matches!(t, SlideTarget::Px { .. }));
+        cx.spawn_in(window, async move |this, cx| {
+            let started = Instant::now();
+            loop {
+                let t = (started.elapsed().as_secs_f32() / 0.24).min(1.0);
+                let w = 5.0;
+                let k = (1.0 - (1.0 + w * t) * (-(w * t)).exp()) / (1.0 - (1.0 + w) * (-w).exp());
+                let finished = t >= 1.0;
+                let Ok(current) = this.update_in(cx, |this, window, cx| {
+                    if !this.active_slides.get(&key).is_some_and(|s| s.id == slide_id) {
+                        return false;
+                    }
+                    if finished {
+                        this.finish_slide(&key, cx);
+                        this.sync(window, cx);
+                    } else {
+                        for target in &targets {
+                            match target {
+                                SlideTarget::Weight { id, from, to } => {
+                                    if let Some(n) = this.find_node_mut(id) {
+                                        n.size = Some(Span::Weight { weight: from + (to - from) * k });
+                                    }
+                                }
+                                SlideTarget::Px { id, from, to } => {
+                                    if let Some(n) = this.find_node_mut(id) {
+                                        n.size = Some(Span::Px { px: from + (to - from) * k });
+                                    }
+                                }
+                            }
+                        }
+                        if has_px && mods::publish_layout(&this.chrome) {
+                            this.refresh_snapshot_mods(cx);
+                        }
+                    }
+                    cx.notify();
+                    true
+                }) else {
+                    return;
+                };
+                if !current || finished {
+                    return;
+                }
+                let (tx, rx) = async_channel::bounded::<()>(1);
+                let tx_timer = tx.clone();
+                cx.on_next_frame(move |_, _| {
+                    let _ = tx.try_send(());
+                });
+                let bg = cx.background_executor().clone();
+                let timer_bg = bg.clone();
+                bg.spawn(async move {
+                    timer_bg.timer(Duration::from_millis(32)).await;
+                    let _ = tx_timer.try_send(());
+                })
+                .detach();
+                if rx.recv().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn slide_zoom(&mut self, pane: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab_id) = self.model.tab_of(pane).map(|c| c.id.clone()) else { return };
+        self.finish_all_slides(cx);
+        let Some(tab) = self.model.tab(&tab_id).cloned() else { return };
+        if tab.root.panes().len() < 2 {
+            self.model.toggle_zoom(pane);
+            return;
+        }
+        let unzooming = tab.zoomed.as_deref() == Some(pane);
+        let chain = self.share_chain(pane);
+        let held_ids: Vec<String> = tab.root.panes().into_iter().map(|n| n.id.clone()).collect();
+        let freeze: HashSet<String> = held_ids.iter().cloned().collect();
+        let moving: HashSet<String> = HashSet::from([pane.to_owned()]);
+        if unzooming {
+            self.model.toggle_zoom(pane);
+            let Some(tab) = self.model.tab(&tab_id) else { return };
+            let settled_sizes: Vec<_> = held_ids.iter().filter_map(|id| {
+                self.shown_size(tab, id, window).map(|size| (id.clone(), size))
+            }).collect();
+            let settled = self.settle_panes(&settled_sizes, window, cx);
+            let forget: HashSet<String> = moving.iter().filter(|id| !settled.contains(*id)).cloned().collect();
+            for (id, _) in &chain {
+                if let Some(n) = self.find_node_mut(id) {
+                    n.size = Some(Span::Weight { weight: 60.0 });
+                }
+            }
+            let targets = chain.iter().map(|(id, weight)| SlideTarget::Weight {
+                id: id.clone(),
+                from: 60.0,
+                to: *weight,
+            }).collect();
+            self.start_slide(tab_id, targets, held_ids, freeze, forget, window, cx, |_, _| {});
+        } else {
+            let settled_sizes: Vec<_> = self.zoomed_size(&tab, pane, window).map(|size| vec![(pane.to_owned(), size)]).unwrap_or_default();
+            let settled = self.settle_panes(&settled_sizes, window, cx);
+            let forget: HashSet<String> = moving.iter().filter(|id| !settled.contains(*id)).cloned().collect();
+            let restore = chain.clone();
+            let targets = chain.iter().map(|(id, weight)| SlideTarget::Weight {
+                id: id.clone(),
+                from: *weight,
+                to: 60.0,
+            }).collect();
+            let id = pane.to_owned();
+            self.start_slide(tab_id, targets, held_ids, freeze, forget, window, cx, move |this, _cx| {
+                this.model.toggle_zoom(&id);
+                for (node, weight) in &restore {
+                    if let Some(n) = this.find_node_mut(node) {
+                        n.size = Some(Span::Weight { weight: *weight });
+                    }
+                }
+            });
+        }
+    }
+
+    /// Removes a pane after its exit animation, ending its terminal.
+    fn close_pane_now(&mut self, pane: &str, cx: &mut Context<Self>) {
+        let addr = self.model.address_of(pane);
+        self.model.remove_pane_evenly(pane);
+        self.closing_panes.remove(pane);
+        self.kill(&addr.into_iter().collect::<Vec<_>>(), cx);
+    }
+
+    /// The slide a pane closes with: the panes beside it grow to even shares
+    /// while its own shrinks to nothing, then it goes. `ended` says its program
+    /// is already gone (nothing left to end). False when it has no container to
+    /// slide in; the caller takes another route.
+    fn slide_close(&mut self, pane: &str, ended: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(tab_id) = self.model.tab_of(pane).map(|c| c.id.clone()) else { return false };
+        self.finish_all_slides(cx);
+        let Some(c) = self.model.tab(&tab_id) else { return false };
+        let container = c.root.parent_of(pane).map(|n| n.id.clone());
+        let children = container.as_deref().and_then(|id| c.root.find(id)).map(|parent| {
+            parent.children().iter().filter(|n| !n.hidden).map(|n| {
+                let weight = match n.size {
+                    Some(Span::Weight { weight }) => weight,
+                    _ => 1.0,
+                };
+                (n.id.clone(), weight)
+            }).collect::<Vec<_>>()
+        }).filter(|children| children.iter().any(|(id, _)| id == pane));
+        let Some(from) = children else { return false };
+        let held_ids: Vec<String> = c.root.panes().into_iter().map(|n| n.id.clone()).collect();
+        let siblings: Vec<String> = from.iter().filter(|(id, _)| id != pane).map(|(id, _)| id.clone()).collect();
+        let mut final_root = c.root.clone();
+        let _ = final_root.remove(pane);
+        for id in &siblings {
+            if let Some(n) = final_root.find_mut(id)
+                && !matches!(n.size, Some(Span::Px { .. }))
+            {
+                n.size = Some(Span::Weight { weight: 1.0 });
+            }
+        }
+        let survivors: Vec<String> = final_root.panes().into_iter().map(|n| n.id.clone()).collect();
+        let settled_sizes: Vec<_> = survivors.iter().filter_map(|id| {
+            self.initial_size(&final_root, id, window).map(|size| (id.clone(), size))
+        }).collect();
+        let settled = self.settle_panes(&settled_sizes, window, cx);
+        let freeze: HashSet<String> = held_ids.iter().cloned().collect();
+        let forget: HashSet<String> = survivors.iter().filter(|id| !settled.contains(*id)).cloned().collect();
+        let targets = from.iter().map(|(id, weight)| SlideTarget::Weight {
+            id: id.clone(),
+            from: *weight,
+            to: if id == pane { 0.0 } else { 1.0 },
+        }).collect();
+        let closing = pane.to_owned();
+        self.closing_panes.insert(closing.clone());
+        self.start_slide(tab_id, targets, held_ids, freeze, forget, window, cx, move |this, cx| {
+            if ended {
+                this.model.remove_pane_evenly(&closing);
+                this.closing_panes.remove(&closing);
+            } else {
+                this.close_pane_now(&closing, cx);
+            }
+        });
+        true
+    }
+
+    /// A pane whose program ended (or that was parked) closes with the same
+    /// slide a hand's close plays. A tab's last pane just goes: there is
+    /// nothing beside it to slide.
+    fn close_pane_on_its_own(&mut self, pane: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing_panes.contains(pane) {
+            return;
+        }
+        if let Some(tab_id) = self.model.tab_of(pane).map(|c| c.id.clone()) {
+            self.finish_slide(&tab_id, cx);
+        }
+        let alone = !self.model.tab_of(pane).is_some_and(|c| c.root.panes().len() > 1);
+        if alone || !self.slide_close(pane, true, window, cx) {
+            self.closing_panes.remove(pane);
+            self.model.remove_pane_evenly(pane);
+        }
+    }
+
+    /// A fresh split slides in: its share grows from a sliver to the share the split gave it.
+    fn slide_split_in(&mut self, pane: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab_id) = self.model.tab_of(pane).map(|c| c.id.clone()) else { return };
+        self.finish_all_slides(cx);
+        let Some(tab) = self.model.tab(&tab_id).cloned() else { return };
+        let held_ids: Vec<String> = tab.root.panes().into_iter().map(|n| n.id.clone()).collect();
+        let freeze: HashSet<String> = held_ids.iter().cloned().collect();
+        let siblings = tab.root.parent_of(pane).map(|parent| {
+            parent.children().iter().filter(|n| !n.hidden).map(|n| {
+                let weight = match n.size {
+                    Some(Span::Weight { weight }) => weight,
+                    _ => 1.0,
+                };
+                (n.id.clone(), weight)
+            }).collect::<Vec<_>>()
+        }).filter(|children| !children.is_empty());
+        if let Some(mut from) = siblings {
+            let mut final_root = tab.root.clone();
+            if from.len() >= 2 {
+                for (id, _) in &from {
+                    if let Some(n) = final_root.find_mut(id) {
+                        n.size = Some(Span::Weight { weight: 1.0 });
+                    }
+                }
+            }
+            let settled_sizes: Vec<_> = held_ids.iter().filter_map(|id| {
+                self.initial_size(&final_root, id, window).map(|size| (id.clone(), size))
+            }).collect();
+            let settled = self.settle_panes(&settled_sizes, window, cx);
+            let forget: HashSet<String> = held_ids.iter().filter(|id| !settled.contains(*id)).cloned().collect();
+            if let Some(n) = self.find_node_mut(pane) {
+                n.size = Some(Span::Weight { weight: 0.02 });
+            }
+            if let Some((_, weight)) = from.iter_mut().find(|(id, _)| id == pane) {
+                *weight = 0.02;
+            }
+            let targets = from.iter().map(|(id, weight)| SlideTarget::Weight {
+                id: id.clone(),
+                from: *weight,
+                to: 1.0,
+            }).collect();
+            self.start_slide(tab_id, targets, held_ids, freeze, forget, window, cx, |_, _| {});
+            return;
+        }
+        let end = match tab.root.find(pane).and_then(|n| n.size) {
+            Some(Span::Weight { weight }) => weight,
+            Some(Span::Px { .. }) => return,
+            None => 1.0,
+        };
+        let mut final_root = tab.root.clone();
+        if let Some(n) = final_root.find_mut(pane) {
+            n.size = Some(Span::Weight { weight: end });
+        }
+        let settled_sizes: Vec<_> = held_ids.iter().filter_map(|id| {
+            self.initial_size(&final_root, id, window).map(|size| (id.clone(), size))
+        }).collect();
+        let settled = self.settle_panes(&settled_sizes, window, cx);
+        let forget: HashSet<String> = held_ids.iter().filter(|id| !settled.contains(*id)).cloned().collect();
+        let start = (end * 0.06).max(0.01);
+        if let Some(n) = self.find_node_mut(pane) {
+            n.size = Some(Span::Weight { weight: start });
+        }
+        let targets = vec![SlideTarget::Weight { id: pane.to_owned(), from: start, to: end }];
+        self.start_slide(tab_id, targets, held_ids, freeze, forget, window, cx, |_, _| {});
+    }
+
+    fn slide_chrome_node(&mut self, id: &str, mode: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let key = format!("chrome:{id}");
+        let cur_px = self.chrome.find(id).and_then(|n| {
+            if n.hidden {
+                self.bounds.borrow().get(id).map(|b| f32::from(b.size.width) / settings::zoom())
+            } else {
+                match n.size {
+                    Some(Span::Px { px }) => Some(px),
+                    _ => None,
+                }
+            }
+        });
+        let was_sliding = self.finish_slide(&key, cx);
+        self.finish_all_slides(cx);
+        let Some(n) = self.chrome.find(id) else { return self.fail(format!("no node {id:?} in the shown layout")) };
+        let want_show = match mode {
+            "layout.toggle" => n.hidden,
+            "layout.show" => true,
+            _ => false,
+        };
+        if !n.hidden == want_show {
+            if was_sliding {
+                self.sync(window, cx);
+                cx.notify();
+            }
+            return;
+        }
+        let explicit_px = match n.size {
+            Some(Span::Px { px }) if px > 1.0 => Some(px),
+            _ => None,
+        };
+        let full_px = if !want_show {
+            let px = explicit_px
+                .or_else(|| self.bounds.borrow().get(id).map(|b| f32::from(b.size.width) / settings::zoom()))
+                .or_else(|| self.saved_px.get(id).copied())
+                .unwrap_or(260.0);
+            self.saved_px.insert(id.to_owned(), px);
+            px
+        } else {
+            explicit_px.or_else(|| self.saved_px.get(id).copied()).unwrap_or(260.0)
+        };
+        let orig_size = n.size;
+        let orig_min = n.min;
+        let from = if was_sliding {
+            cur_px.unwrap_or(if want_show { 0.0 } else { full_px })
+        } else if want_show {
+            0.0
+        } else {
+            full_px
+        };
+        let to = if want_show { full_px } else { 0.0 };
+        let final_size = match orig_size {
+            Some(Span::Px { .. }) => Some(Span::Px { px: full_px }),
+            other => other,
+        };
+        let mut final_chrome = self.chrome.clone();
+        if let Some(n) = final_chrome.find_mut(id) {
+            n.hidden = !want_show;
+            n.size = final_size;
+            n.min = orig_min;
+        }
+        let held_ids: Vec<String> = self.model.active_tab().map(|tab| {
+            tab.root.panes().into_iter().map(|n| n.id.clone()).collect()
+        }).unwrap_or_default();
+        let mut settled_sizes = Vec::new();
+        if let Some(target_area) = self.context_area_for(&final_chrome)
+            && let Some(tab) = self.model.active_tab()
+        {
+            let focused: HashSet<String> = tab.focused_pane().and_then(|f| tab.root.path_to(&f)).unwrap_or_default().into_iter().collect();
+            let shown = tab.shown();
+            for pane in shown.panes() {
+                if let Some(size) = self.size_in(shown, tab.root.panes().len(), &pane.id, target_area, &focused, window) {
+                    settled_sizes.push((pane.id.clone(), size));
+                }
+            }
+        }
+        let settled = self.settle_panes(&settled_sizes, window, cx);
+        let freeze: HashSet<String> = held_ids.iter().cloned().collect();
+        let forget: HashSet<String> = held_ids.iter().filter(|id| !settled.contains(*id)).cloned().collect();
+        if let Some(n) = self.chrome.find_mut(id) {
+            if want_show {
+                n.hidden = false;
+            }
+            n.min = None;
+            n.size = Some(Span::Px { px: from });
+        }
+        let node_id = id.to_owned();
+        let targets = vec![SlideTarget::Px { id: id.to_owned(), from, to }];
+        self.start_slide(key, targets, held_ids, freeze, forget, window, cx, move |this, _cx| {
+            if let Some(n) = this.chrome.find_mut(&node_id) {
+                n.min = orig_min;
+                n.size = orig_size;
+                n.hidden = !want_show;
+            }
+        });
+        if want_show {
+            self.sync(window, cx);
+        } else if mods::publish_layout(&self.chrome) {
+            self.refresh_snapshot_mods(cx);
+        }
     }
 
     /// A mod as a pane beside the target (a viewer next to the shell).
@@ -2846,7 +3354,7 @@ impl AppWindow {
                 };
                 if closed {
                     self.notify_launch_failure(&addr, window, cx);
-                    self.model.remove_pane(&pane);
+                    self.close_pane_on_its_own(&pane, window, cx);
                     changed = true;
                 }
             }
@@ -2959,7 +3467,7 @@ impl AppWindow {
                 if let Some(pane) = self.model.pane_of(&address) { self.model.focus_pane(&pane); }
             }
             TerminalChange::Park => {
-                if let Some(pane) = self.model.pane_of(&address) { self.model.remove_pane(&pane); }
+                if let Some(pane) = self.model.pane_of(&address) { self.close_pane_on_its_own(&pane, window, cx); }
             }
         }
         if !self.draining {
@@ -3336,6 +3844,11 @@ impl AppWindow {
                     Some(name) => self.split_mod(Self::owned(a, "pane"), axis, name, a.get("props").cloned().unwrap_or(Value::Null)),
                     None => self.split(Self::owned(a, "pane"), axis, Self::argv(a), None, window),
                 };
+                if let Ok(v) = &r
+                    && let Some(pane) = v.get("pane").and_then(Value::as_str)
+                {
+                    self.pending_split = Some(pane.to_owned());
+                }
                 self.answer(r);
             }
             "pane.close" => {
@@ -3348,13 +3861,63 @@ impl AppWindow {
                     let id = c.id.clone();
                     return self.dispatch("tab.close", &json!({ "id": id }), person, window, cx);
                 }
-                let addr = self.model.address_of(&pane);
-                self.model.remove_pane(&pane);
-                self.kill(&addr.into_iter().collect::<Vec<_>>(), cx);
+                let Some(survivor) = c.root.panes().into_iter().find(|n| n.id != pane).map(|n| n.id.clone()) else { return };
+                let container = c.root.parent_of(&pane).map(|n| n.id.clone());
+                if self.slide_close(&pane, false, window, cx) {
+                    return;
+                }
+                let Some((tab_id, held_ids, root)) = self.model.tab_of(&pane).map(|c| {
+                    let panes = c.root.panes().into_iter().map(|n| n.id.clone()).collect::<Vec<_>>();
+                    (c.id.clone(), panes, c.root.clone())
+                }) else { return };
+                let siblings: Vec<String> = container.as_deref().and_then(|id| root.find(id)).map(|parent| {
+                    parent.children().iter().filter(|n| n.id != pane && !n.hidden).map(|n| n.id.clone()).collect()
+                }).unwrap_or_default();
+                let mut final_root = root;
+                let _ = final_root.remove(&pane);
+                for id in &siblings {
+                    if let Some(n) = final_root.find_mut(id)
+                        && !matches!(n.size, Some(Span::Px { .. }))
+                    {
+                        n.size = Some(Span::Weight { weight: 1.0 });
+                    }
+                }
+                let survivors: Vec<String> = final_root.panes().into_iter().map(|n| n.id.clone()).collect();
+                let settled_sizes: Vec<_> = survivors.iter().filter_map(|id| {
+                    self.initial_size(&final_root, id, window).map(|size| (id.clone(), size))
+                }).collect();
+                let settled = self.settle_panes(&settled_sizes, window, cx);
+                let freeze: HashSet<String> = held_ids.iter().cloned().collect();
+                let forget: HashSet<String> = survivors.iter().filter(|id| !settled.contains(*id)).cloned().collect();
+                let chain = self.share_chain(&survivor);
+                let targets = chain.iter().map(|(id, weight)| SlideTarget::Weight {
+                    id: id.clone(),
+                    from: *weight,
+                    to: 60.0,
+                }).collect();
+                let closing = pane.clone();
+                let restore = chain.clone();
+                self.start_slide(tab_id, targets, held_ids, freeze, forget, window, cx, move |this, cx| {
+                    this.close_pane_now(&closing, cx);
+                    for (node, weight) in &restore {
+                        if let Some(n) = this.find_node_mut(node) {
+                            n.size = Some(Span::Weight { weight: *weight });
+                        }
+                    }
+                    if let Some(container) = &container
+                        && let Some(n) = this.find_node_mut(container)
+                        && let Some(children) = n.children_mut()
+                    {
+                        for child in children.iter_mut().filter(|n| !n.hidden) {
+                            child.size = Some(Span::Weight { weight: 1.0 });
+                        }
+                    }
+                });
+                return;
             }
             "pane.zoom" => {
                 if let Some(pane) = Self::owned(a, "pane").or_else(|| self.model.focused_pane()) {
-                    self.model.toggle_zoom(&pane);
+                    self.slide_zoom(&pane, window, cx);
                 }
             }
             "pane.focus" => {
@@ -3643,6 +4206,11 @@ impl AppWindow {
             },
             "layout.toggle" | "layout.show" | "layout.hide" => {
                 let id = Self::arg(a, "id").unwrap_or_default();
+                if a.get("slide").and_then(Value::as_bool).unwrap_or(false) {
+                    self.slide_chrome_node(id, name, window, cx);
+                    return;
+                }
+                self.finish_slide(&format!("chrome:{id}"), cx);
                 let Some(n) = self.chrome.find_mut(id) else { return self.fail(format!("no node {id:?} in the shown layout")) };
                 n.hidden = match name {
                     "layout.toggle" => !n.hidden,
@@ -3812,6 +4380,9 @@ impl AppWindow {
             }
         }
         self.sync(window, cx);
+        if let Some(pane) = self.pending_split.take() {
+            self.slide_split_in(&pane, window, cx);
+        }
     }
 
     fn find_node_mut(&mut self, id: &str) -> Option<&mut Node> {
@@ -7501,6 +8072,196 @@ export default class Probe extends View {
     }
 
     include!("window/pane_size_tests.rs");
+
+    #[test]
+    fn slide_chrome_is_idempotent_and_preemptible() {
+        in_own_process("slide_chrome_idempotent");
+    }
+
+    #[gpui::test]
+    fn slide_chrome_idempotent(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        if !running_alone("slide_chrome_idempotent") { return; }
+        let layout = json!({
+            "id": "root", "type": "row", "children": [
+                {"id": "sidebar", "type": "block", "size": {"px": 268}, "min": 44,
+                 "content": {"mod": "size-probe"}}
+            ]
+        });
+        let (view, cx) = open_window(cx, "size-probe", "export default () => null;", layout);
+        view.update_in(cx, |this, window, cx| {
+            let slide = |this: &mut super::AppWindow, name: &str, args: serde_json::Value, window: &mut Window, cx: &mut Context<super::AppWindow>| {
+                let reply = this.run_as(name, args, false, window, cx);
+                assert!(reply.get("error").is_none(), "{reply}");
+            };
+            let sidebar = |this: &super::AppWindow| {
+                let n = this.chrome.find("sidebar").expect("sidebar");
+                (n.hidden, n.min, n.size, this.active_slides.contains_key("chrome:sidebar"))
+            };
+
+            slide(this, "layout.hide", json!({"id": "sidebar", "slide": true}), window, cx);
+            assert_eq!(sidebar(this), (false, None, Some(super::Span::Px { px: 268.0 }), true));
+            slide(this, "layout.hide", json!({"id": "sidebar", "slide": true}), window, cx);
+            assert_eq!(sidebar(this), (true, Some(44.0), Some(super::Span::Px { px: 268.0 }), false), "a repeated hide must finish, not start a phantom slide");
+
+            slide(this, "layout.show", json!({"id": "sidebar", "slide": true}), window, cx);
+            assert_eq!(sidebar(this), (false, None, Some(super::Span::Px { px: 0.0 }), true));
+            slide(this, "layout.show", json!({"id": "sidebar", "slide": true}), window, cx);
+            assert_eq!(sidebar(this), (false, Some(44.0), Some(super::Span::Px { px: 268.0 }), false), "a repeated show must finish visibly");
+
+            slide(this, "layout.hide", json!({"id": "sidebar", "slide": true}), window, cx);
+            assert!(sidebar(this).3);
+            slide(this, "layout.show", json!({"id": "sidebar"}), window, cx);
+            assert_eq!(sidebar(this), (false, Some(44.0), Some(super::Span::Px { px: 268.0 }), false), "a non-slide command must finish the chrome slide");
+        });
+        cx.executor().advance_clock(std::time::Duration::from_millis(64));
+        cx.run_until_parked();
+    }
+
+    #[test]
+    fn zoomed_size_keeps_the_pane_header() {
+        in_own_process("zoomed_size_header");
+    }
+
+    #[gpui::test]
+    fn zoomed_size_header(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        if !running_alone("zoomed_size_header") { return; }
+        let framed = json!({"id": "context", "type": "block", "content": {"tab": "active", "pane": {
+            "lone": false,
+            "header": {"height": 80, "content": {"mod": "size-probe"}}
+        }}});
+        let (view, cx) = open_window(cx, "size-probe", "export default () => null;", framed);
+        view.update_in(cx, |this, window, cx| {
+            this.folders.retain(|id, _| id == "size-probe");
+            this.model = crate::model::Model::default();
+            let mut tab = super::Tab::new("tab", "", "a", "probe-a");
+            tab.root.split("a", super::Axis::Row, crate::model::pane("b", "probe-b"), "split".into());
+            tab.focus("a");
+            this.model.add_space("space", "test", "/", tab);
+            this.sync(window, cx);
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let (zoomed, without_header) = view.update_in(cx, |this, window, _| {
+            let tab = this.model.tab("tab").unwrap();
+            let zoomed = this.zoomed_size(tab, "a", window).expect("a zoomed grid");
+            let pane = tab.root.find("a").unwrap();
+            let without_header = this.initial_size(pane, "a", window).expect("an unframed grid");
+            (zoomed, without_header)
+        });
+        assert_eq!(zoomed.0, without_header.0, "the fixed pane header only changes the grid's height");
+        assert!(zoomed.1 < without_header.1, "lone:false with more than one pane must reserve the header: {zoomed:?} vs {without_header:?}");
+
+        view.update_in(cx, |this, window, cx| {
+            this.model.tab_mut("tab").unwrap().zoomed = Some("a".into());
+            this.sync(window, cx);
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let actual = view.update(cx, |this, cx| this.terms["a"].view.read(cx).dimensions());
+        assert_eq!(actual, zoomed, "the zoomed terminal must be fit to the framed grid");
+    }
+
+    #[test]
+    fn chrome_slide_pre_settles_the_pane_to_the_target_area() {
+        in_own_process("chrome_slide_pre_settle");
+    }
+
+    #[gpui::test]
+    fn chrome_slide_pre_settle(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        if !running_alone("chrome_slide_pre_settle") { return; }
+        let layout = json!({
+            "id": "root", "type": "row", "children": [
+                {"id": "sidebar", "type": "block", "size": {"px": 268}, "min": 44,
+                 "content": {"mod": "size-probe"}},
+                {"id": "work", "type": "column", "children": [
+                    {"id": "context", "type": "block", "content": {"tab": "active"}}
+                ]}
+            ]
+        });
+        let (view, cx) = open_window(cx, "size-probe", "export default () => null;", layout);
+        view.update_in(cx, |this, window, cx| {
+            this.model = crate::model::Model::default();
+            this.model.add_space("space", "test", "/", super::Tab::new("tab", "", "a", "probe-a"));
+            this.sync(window, cx);
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let (visible_area, hidden_area, visible_size, hidden_size) = view.update_in(cx, |this, window, _| {
+            let area = |hidden| {
+                let mut chrome = this.chrome.clone();
+                chrome.find_mut("sidebar").unwrap().hidden = hidden;
+                this.context_area_for(&chrome).expect("context area")
+            };
+            let (visible_area, hidden_area) = (area(false), area(true));
+            let tab = this.model.active_tab().unwrap();
+            let focused: std::collections::HashSet<String> = tab.focused_pane().and_then(|f| tab.root.path_to(&f)).unwrap_or_default().into_iter().collect();
+            let shown = tab.shown();
+            let visible_size = this.size_in(shown, tab.root.panes().len(), "a", visible_area, &focused, window).unwrap();
+            let hidden_size = this.size_in(shown, tab.root.panes().len(), "a", hidden_area, &focused, window).unwrap();
+            (visible_area, hidden_area, visible_size, hidden_size)
+        });
+        assert!(hidden_area.width > visible_area.width, "hiding the sidebar must widen the tab area");
+        assert_ne!(visible_size, hidden_size);
+
+        let visible_dims = view.update(cx, |this, cx| this.terms["a"].view.read(cx).dimensions());
+        assert_eq!(visible_dims, visible_size, "the drawn pane starts at its visible size");
+        view.update_in(cx, |this, window, cx| {
+            let out = this.run_as("layout.hide", json!({"id": "sidebar", "slide": true}), false, window, cx);
+            assert!(out.get("error").is_none(), "{out}");
+            assert!(this.has_chrome_slide());
+            let dims = this.terms["a"].view.read(cx).dimensions();
+            assert_eq!(dims, hidden_size, "hide must settle the pane before its first animation frame");
+
+            let out = this.run_as("layout.hide", json!({"id": "sidebar", "slide": true}), false, window, cx);
+            assert!(out.get("error").is_none(), "{out}");
+            assert!(!this.has_chrome_slide());
+            let out = this.run_as("layout.show", json!({"id": "sidebar", "slide": true}), false, window, cx);
+            assert!(out.get("error").is_none(), "{out}");
+            assert!(this.has_chrome_slide());
+            let dims = this.terms["a"].view.read(cx).dimensions();
+            assert_eq!(dims, visible_size, "show must settle the pane before its first animation frame");
+        });
+    }
+
+    #[test]
+    fn save_and_switch_layout_are_safe_during_a_chrome_slide() {
+        in_own_process("chrome_slide_save");
+    }
+
+    #[gpui::test]
+    fn chrome_slide_save(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        if !running_alone("chrome_slide_save") { return; }
+        let layout = json!({
+            "id": "root", "type": "row", "children": [
+                {"id": "sidebar", "type": "block", "size": {"px": 268}, "min": 44,
+                 "content": {"mod": "size-probe"}},
+                {"id": "context", "type": "block", "content": {"tab": "active"}}
+            ]
+        });
+        let (view, cx) = open_window(cx, "size-probe", "export default () => null;", layout);
+        std::fs::write(super::layout_path("other"), json!({
+            "id": "other", "type": "block", "content": {"mod": "size-probe"}
+        }).to_string()).unwrap();
+        view.update_in(cx, |this, window, cx| {
+            let layout_path = super::layout_path("test");
+            let state_path = super::state_path("test");
+            let layout_before = std::fs::read_to_string(&layout_path).unwrap();
+            let state_before = std::fs::read_to_string(&state_path).ok();
+            let out = this.run_as("layout.hide", json!({"id": "sidebar", "slide": true}), false, window, cx);
+            assert!(out.get("error").is_none(), "{out}");
+            assert!(this.has_chrome_slide());
+            this.chrome.find_mut("sidebar").unwrap().size = Some(super::Span::Px { px: 123.0 });
+            this.save();
+            assert_eq!(std::fs::read_to_string(&layout_path).unwrap(), layout_before, "save must not write layout during a chrome slide");
+            assert_eq!(std::fs::read_to_string(&state_path).ok(), state_before, "save must not write state during a chrome slide");
+
+            this.switch_layout(Some("other"), window, cx);
+            assert!(this.active_slides.is_empty(), "switch_layout must finish every slide");
+            assert_eq!(this.layout_name, "other");
+            assert!(this.saved_px.is_empty(), "switching layouts clears saved chrome widths");
+        });
+    }
 
     /// What a `{"command":"tab.move","args":{"by":-1}}` key runs.
     #[test]

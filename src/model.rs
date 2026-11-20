@@ -259,6 +259,7 @@ impl Model {
             self.before.truncate(32);
         }
         self.active = Some(id.to_owned());
+        self.shown_tab = self.space(id).and_then(|p| p.active.clone());
     }
 
     pub fn active_space(&self) -> Option<&Space> {
@@ -355,15 +356,21 @@ impl Model {
     }
 
     fn insert_tab(&mut self, space: &str, ctx: Tab, select: bool) -> bool {
-        let Some(p) = self.space_mut(space) else { return false };
-        if !select {
-            p.tabs.push(ctx);
-            return true;
-        }
-        let at = p.active.as_deref().and_then(|a| p.tabs.iter().position(|c| c.id == a)).map_or(p.tabs.len(), |i| i + 1);
+        let active = self.active.as_deref() == Some(space);
         let id = ctx.id.clone();
-        p.tabs.insert(at, ctx);
-        p.shown(&id);
+        {
+            let Some(p) = self.space_mut(space) else { return false };
+            if !select {
+                p.tabs.push(ctx);
+                return true;
+            }
+            let at = p.active.as_deref().and_then(|a| p.tabs.iter().position(|c| c.id == a)).map_or(p.tabs.len(), |i| i + 1);
+            p.tabs.insert(at, ctx);
+            p.shown(&id);
+        }
+        if active {
+            self.shown_tab = Some(id);
+        }
         true
     }
 
@@ -460,6 +467,32 @@ impl Model {
         (true, space_closed)
     }
 
+    /// Removes a pane the way a hand closes it: the pane takes its share with
+    /// it, so the panes left in a row share it evenly (a third of three closes
+    /// to a half of two). A program exiting, or a terminal being parked, comes
+    /// here: `remove_pane` alone hands the share to one neighbor, which is what
+    /// a slide-close undoes first.
+    pub fn remove_pane_evenly(&mut self, pane_id: &str) -> (bool, bool) {
+        let siblings: Vec<String> = self
+            .tab_of(pane_id)
+            .and_then(|c| c.root.parent_of(pane_id))
+            .map(|p| p.children().iter().filter(|n| n.id != pane_id && !n.hidden).map(|n| n.id.clone()).collect())
+            .unwrap_or_default();
+        let out = self.remove_pane(pane_id);
+        if let Some(first) = siblings.first().cloned()
+            && let Some(root) = self.tab_of_mut(&first).map(|c| &mut c.root)
+        {
+            for id in &siblings {
+                if let Some(n) = root.find_mut(id)
+                    && !matches!(n.size, Some(crate::layout::Size::Px { .. }))
+                {
+                    n.size = Some(crate::layout::Size::Weight { weight: 1.0 });
+                }
+            }
+        }
+        out
+    }
+
     /// Removes a tab. Returns its terminal addresses and whether its space closed.
     pub fn remove_tab(&mut self, ctx: &str) -> (Vec<String>, bool) {
         let Some(pi) = self.spaces.iter().position(|p| p.tab(ctx).is_some()) else { return (vec![], false) };
@@ -530,7 +563,7 @@ impl Model {
             let shown = self
                 .shown_tab
                 .clone()
-                .filter(|a| p.tabs.iter().any(|c| c.id == *a))
+                .filter(|a| p.tabs.iter().position(|c| c.id == *a).is_some_and(|ti| flat.contains(&(pi, ti))))
                 .or_else(|| p.active.clone().filter(|a| p.tabs.iter().any(|c| c.id == *a)))
                 .or_else(|| p.tabs.first().map(|c| c.id.clone()))?;
             let ti = p.tabs.iter().position(|c| c.id == shown)?;
@@ -548,13 +581,21 @@ impl Model {
     pub fn settle(&mut self, ctx: &str, now: u64) -> bool {
         let Some(c) = self.tab_mut(ctx) else { return false };
         c.settled = Some(now);
-        let Some(p) = self.spaces.iter_mut().find(|p| p.tab(ctx).is_some()) else { return true };
-        if p.active_tab().is_some_and(|c| c.id == ctx) {
-            let i = p.tabs.iter().position(|c| c.id == ctx).unwrap_or(0);
-            let n = p.tabs.len();
-            if let Some(next) = (1..n).map(|k| &p.tabs[(i + k) % n]).find(|c| c.settled.is_none()) {
-                p.active = Some(next.id.clone());
+        let handed_to = {
+            let Some(p) = self.spaces.iter_mut().find(|p| p.tab(ctx).is_some()) else { return true };
+            let mut handed_to = None;
+            if p.active_tab().is_some_and(|c| c.id == ctx) {
+                let i = p.tabs.iter().position(|c| c.id == ctx).unwrap_or(0);
+                let n = p.tabs.len();
+                if let Some(next) = (1..n).map(|k| &p.tabs[(i + k) % n]).find(|c| c.settled.is_none()) {
+                    p.active = Some(next.id.clone());
+                    handed_to = Some(next.id.clone());
+                }
             }
+            handed_to
+        };
+        if let Some(next) = handed_to {
+            self.shown_tab = Some(next);
         }
         true
     }
@@ -815,6 +856,36 @@ mod tests {
         assert!(m.step_tab_all(1));
         assert_eq!(m.active_tab().map(|t| t.id.as_str()), Some("c1"));
         assert_eq!(m.active.as_deref(), Some("p1"));
+    }
+
+    #[test]
+    fn a_tab_made_with_add_tab_is_where_stepping_starts() {
+        let mut m = Model::default();
+        m.add_space("p1", "a", "/a", Tab::new("c1", "one", "x1", "t1"));
+        m.add_tab("p1", Tab::new("c2", "two", "x2", "t2"));
+        m.select_tab("c2");
+        m.add_tab("p1", Tab::new("c3", "three", "x3", "t3"));
+        // Forward from a new tab moves on, instead of landing on the tab already shown.
+        assert!(m.step_tab_all(1));
+        assert_eq!(m.active_tab().map(|t| t.id.as_str()), Some("c1"));
+        assert!(m.step_tab_all(-1));
+        assert_eq!(m.active_tab().map(|t| t.id.as_str()), Some("c3"));
+        assert!(m.step_tab_all(-1));
+        assert_eq!(m.active_tab().map(|t| t.id.as_str()), Some("c2"));
+        assert!(m.step_tab_all(1));
+        assert_eq!(m.active_tab().map(|t| t.id.as_str()), Some("c3"));
+    }
+
+    #[test]
+    fn settling_the_shown_tab_steps_from_the_one_it_hands_over_to() {
+        let mut m = Model::default();
+        m.add_space("p1", "a", "/a", Tab::new("c1", "one", "x1", "t1"));
+        m.add_tab("p1", Tab::new("c2", "two", "x2", "t2"));
+        m.add_tab("p1", Tab::new("c3", "three", "x3", "t3"));
+        m.select_tab("c2");
+        assert!(m.settle("c2", 1));
+        assert!(m.step_tab_all(-1));
+        assert_eq!(m.active_tab().map(|t| t.id.as_str()), Some("c1"));
     }
 
     #[test]
@@ -1152,6 +1223,23 @@ mod tests {
         assert_eq!(m.focused_pane().as_deref(), Some("x1"));
         // The arrangement keeps the tab's id with one pane left.
         assert_eq!(m.active_tab().unwrap().root.id, "c1");
+    }
+
+    #[test]
+    fn a_program_exiting_leaves_the_other_panes_equal() {
+        let mut m = model_with_one();
+        m.split("x1", Axis::Row, "x2", "t2");
+        m.split("x2", Axis::Row, "x3", "t3");
+        let weights = |m: &Model| -> Vec<f32> {
+            m.tab("c1").unwrap().root.children().iter().map(|n| match n.size {
+                Some(crate::layout::Size::Weight { weight }) => weight,
+                _ => 1.0,
+            }).collect()
+        };
+        // Three thirds with the middle one exiting (or parked): the two left
+        // share it evenly, as a hand's close slides them to.
+        m.remove_pane_evenly("x2");
+        assert_eq!(weights(&m), [1.0, 1.0]);
     }
 
     #[test]
