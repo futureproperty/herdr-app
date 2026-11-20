@@ -4600,7 +4600,10 @@ impl AppWindow {
         let body = div().flex_1().min_h_0().flex().child(inner);
         let Some(h) = &f.header else { return el.child(body).into_any_element() };
         let head = div().flex_none().h(settings::z(pane_size::header_height(h))).w_full().flex()
-            .child(self.render_slot(&format!("{}#frame", n.id), cx));
+            .child(
+                div().size_full().flex().opacity(if on { 1.0 } else { crate::terminal::UNFOCUSED_DIM })
+                    .child(self.render_slot(&format!("{}#frame", n.id), cx)),
+            );
         if h.hover() {
             let head = head.absolute().left_0().right_0().opacity(0.).group_hover(group, |s| s.opacity(1.));
             let head = if h.bottom() { head.bottom_0() } else { head.top_0() };

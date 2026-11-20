@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 const OUTPUT_TIME_PER_TURN: Duration = Duration::from_millis(6);
 const SEARCH_POLL_MS: u64 = 33;
+pub(crate) const UNFOCUSED_DIM: f32 = 0.55;
 
 fn output_turn(
     first: Stream,
@@ -144,8 +145,8 @@ struct Grid {
     track: Option<Bounds<Pixels>>,
     /// Each row's drawing by position, kept while the row is the same (`Rc`).
     painted: Vec<(Rc<Vec<vt::Cell>>, Vec<RowOp>, Option<usize>)>,
-    /// Font size, cell size, cell font, loaded fonts and ligature setting used to draw.
-    painted_with: (u32, Size<Pixels>, Font, u64, bool),
+    /// Font size, cell size, cell font, loaded fonts, ligature setting and focus used to draw.
+    painted_with: (u32, Size<Pixels>, Font, u64, bool, bool),
 }
 
 pub struct TerminalView {
@@ -329,7 +330,7 @@ impl TerminalView {
                 thumb: None,
                 track: None,
                 painted: Vec::new(),
-                painted_with: (0, Size::default(), font(""), 0, false),
+                painted_with: (0, Size::default(), font(""), 0, false, false),
             })),
             focus: cx.focus_handle(),
             was_focused: false,
@@ -1951,7 +1952,7 @@ enum RowOp {
 /// A row's drawing: its backgrounds, merged into runs of one color, then its
 /// text in runs of one style (wide characters, sprites and icons on their own),
 /// then its underlines and strikethroughs.
-fn row_ops(row: &[vt::Cell], cell: Size<Pixels>, cursor: Option<usize>, window: &mut Window) -> Vec<RowOp> {
+fn row_ops(row: &[vt::Cell], cell: Size<Pixels>, cursor: Option<usize>, dim: f32, window: &mut Window) -> Vec<RowOp> {
     crate::bench::count(&crate::bench::ROWS);
     let ligatures = crate::settings::get().font_ligatures;
     let mut ops = Vec::new();
@@ -1977,7 +1978,7 @@ fn row_ops(row: &[vt::Cell], cell: Size<Pixels>, cursor: Option<usize>, window: 
         if c.text.is_empty() && c.underline.is_none() && !c.strike {
             continue;
         }
-        let color = cell_color(c);
+        let color = cell_color(c, dim);
         if crate::sprites::is_sprite(&c.text) {
             ops.push(RowOp::Sprite { x: start, text: c.text.clone(), color });
             continue;
@@ -2045,18 +2046,18 @@ fn row_ops(row: &[vt::Cell], cell: Size<Pixels>, cursor: Option<usize>, window: 
             .with_cell_positions(&positions, width);
         ops.push(RowOp::Text { x: start, line });
     }
-    row_decorations(row, &mut ops);
+    row_decorations(row, dim, &mut ops);
     ops
 }
 
-/// A cell's text color, dimmed when faint.
-fn cell_color(c: &vt::Cell) -> Hsla {
-    hsla(c.fg).opacity(if c.faint { 0.6 } else { 1.0 })
+/// A cell's text color, dimmed when faint or unfocused.
+fn cell_color(c: &vt::Cell, dim: f32) -> Hsla {
+    hsla(c.fg).opacity((if c.faint { 0.6 } else { 1.0 }) * dim)
 }
 
 /// A row's underlines and strikethroughs, from its cells alone, so sprites,
 /// icons and blanks get them too. Neighbours that look the same share one.
-fn row_decorations(row: &[vt::Cell], ops: &mut Vec<RowOp>) {
+fn row_decorations(row: &[vt::Cell], dim: f32, ops: &mut Vec<RowOp>) {
     let mut x = 0;
     while x < row.len() {
         let c = &row[x];
@@ -2065,7 +2066,7 @@ fn row_decorations(row: &[vt::Cell], ops: &mut Vec<RowOp>) {
         if c.underline.is_none() && !c.strike {
             continue;
         }
-        let color = cell_color(c);
+        let color = cell_color(c, dim);
         let underline = c.underline.map(|s| (s, c.underline_color.map_or(color, |u| hsla(u).opacity(color.a))));
         let strike = c.strike.then_some(color);
         match ops.last_mut() {
@@ -2090,6 +2091,7 @@ fn find_input_style() -> InputEditorStyle {
 
 fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, window: &mut Window, cx: &mut App) {
     crate::bench::count(&crate::bench::GRID);
+    let dim = if focused { 1.0 } else { UNFOCUSED_DIM };
     let mut g = grid.borrow_mut();
     let cell = g.cell;
     let metrics = cell_metrics(window);
@@ -2155,7 +2157,7 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
     let ligatures = crate::settings::get().font_ligatures;
     let cursor = frame.cursor_cell.filter(|_| ligatures);
     // The whole cell font, so a weight change redraws kept rows too.
-    let with = (crate::settings::font_size().to_bits(), cell, cell_font(false, false), crate::settings::fonts_added(), ligatures);
+    let with = (crate::settings::font_size().to_bits(), cell, cell_font(false, false), crate::settings::fonts_added(), ligatures, focused);
     // When every row changed (output scrolling), nothing is kept: the next
     // frame would find none of them the same.
     let mut painted = std::mem::take(&mut grid.borrow_mut().painted);
@@ -2166,7 +2168,7 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
     for (y, row) in frame.rows.iter().enumerate() {
         let column = cursor.filter(|(_, cy)| *cy as usize == y).map(|(x, _)| x as usize);
         if frame.all || painted.get(y).is_none_or(|(r, _, c)| !Rc::ptr_eq(r, row) || *c != column) {
-            let ops = row_ops(row, cell, column, window);
+            let ops = row_ops(row, cell, column, dim, window);
             if y < painted.len() {
                 painted[y] = (row.clone(), ops, column);
             } else {
@@ -2199,7 +2201,7 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
                 continue;
             }
             let opacity = if selected { 0.55 } else { 0.28 };
-            let highlight = crate::settings::color("accent").opacity(opacity);
+            let highlight = crate::settings::color("accent").opacity(opacity * dim);
             let b = Bounds::new(at(start, y), size(cell.width * (end - start) as f32, cell.height));
             window.paint_quad(fill(snap_box(b), highlight));
         }
@@ -2274,7 +2276,7 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
         let color = row.get(x0 as usize).map_or(hsla(vt::theme().fg), |c| hsla(c.fg));
         let (x0, x1) = (x0 as usize, (x1 as usize + 1).min(row.len()));
         let line = Bounds::new(at(x0, y as usize) + point(px(0.0), metrics.underline), size(cell.width * (x1 - x0) as f32, metrics.underline_thickness));
-        window.paint_quad(fill(snap_box(line), color));
+        window.paint_quad(fill(snap_box(line), color.opacity(dim)));
     }
 
     paint_images(false, window);
@@ -2306,7 +2308,7 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
                 snap_box(Bounds::new(p + point(px(0.0), cell.height - px(2.0)), size(w, px(2.0)))),
                 color,
             )),
-            _ => window.paint_quad(outline(snap_box(Bounds::new(p, size(w, cell.height))), color, BorderStyle::Solid)),
+            _ => window.paint_quad(outline(snap_box(Bounds::new(p, size(w, cell.height))), color.opacity(dim), BorderStyle::Solid)),
         }
     }
     // What an input method is composing, at the cursor (hidden or not):
@@ -2347,9 +2349,9 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
             let x = lane.origin.x + lane.size.width - w - px(2.0);
             let color = crate::settings::color("muted");
             let rail = Bounds::new(point(x + w / 2.0 - px(0.5), origin.y), size(px(1.0), px(track)));
-            window.paint_quad(fill(snap_box(rail), color.opacity(0.35)));
+            window.paint_quad(fill(snap_box(rail), color.opacity(0.35 * dim)));
             let thumb = Bounds::new(point(x, origin.y + px(top)), size(w, px(len)));
-            window.paint_quad(fill(snap_box(thumb), color).corner_radii(w / 2.0));
+            window.paint_quad(fill(snap_box(thumb), color.opacity(dim)).corner_radii(w / 2.0));
             g.thumb = Some(Bounds::new(point(lane.origin.x, thumb.origin.y), size(lane.size.width, thumb.size.height)));
             g.track = Some(lane);
         }
@@ -2914,6 +2916,34 @@ mod tests {
             assert!(terminal.lost, "the fitted pane must attempt to attach");
             assert_eq!(terminal.dimensions(), (114, 30));
         });
+    }
+
+    #[gpui::test]
+    fn unfocused_terminal_colors_dim_only_the_foreground(cx: &mut gpui::TestAppContext) {
+        use super::*;
+
+        let window = cx.add_window(|_, _| Empty);
+        window.update(cx, |_, window, _| {
+            let color = vt::Rgb(200, 120, 40);
+            let cell = vt::Cell { text: "─".into(), fg: color, ..Default::default() };
+            assert_eq!(cell_color(&cell, 1.0).a, 1.0);
+            assert_eq!(cell_color(&cell, UNFOCUSED_DIM).a, UNFOCUSED_DIM);
+            let faint = vt::Cell { faint: true, ..cell.clone() };
+            assert_eq!(cell_color(&faint, UNFOCUSED_DIM).a, 0.6 * UNFOCUSED_DIM);
+
+            let row = [vt::Cell { bg: Some(vt::Rgb(3, 4, 5)), ..cell }];
+            let ops = row_ops(&row, size(px(8.), px(16.)), None, UNFOCUSED_DIM, window);
+            let bg = ops.iter().find_map(|op| match op {
+                RowOp::Bg { color, .. } => Some(*color),
+                _ => None,
+            }).expect("the cell background must paint");
+            let fg = ops.iter().find_map(|op| match op {
+                RowOp::Sprite { color, .. } => Some(*color),
+                _ => None,
+            }).expect("the foreground sprite must paint");
+            assert_eq!(bg.a, 1.0, "cell backgrounds must stay fully opaque");
+            assert_eq!(fg.a, UNFOCUSED_DIM, "foreground colors must use the unfocused dim factor");
+        }).unwrap();
     }
 
     #[gpui::test]
@@ -3847,7 +3877,7 @@ mod tests {
                             let mut row = vec![vt::Cell { text: text.to_string(), wide, fg: vt::Rgb(255, 0, 0), ..Default::default() }];
                             if wide { row.push(vt::Cell::default()); }
                             row.push(vt::Cell { text: "a".into(), fg: vt::Rgb(255, 255, 255), ..Default::default() });
-                            for op in row_ops(&row, cell, None, window) {
+                            for op in row_ops(&row, cell, None, 1.0, window) {
                                 if let RowOp::Text { x, line } = op {
                                     line.paint(point(px(4.) + cell.width * x as f32, cell.height * y as f32), cell.height, TextAlign::Left, None, window, cx).unwrap();
                                 }
@@ -3876,7 +3906,7 @@ mod tests {
             let image = window.render_to_image().unwrap();
             let row: Vec<_> = ["a", "🕹", "a", "🖥", "a", "🌡", "a"].into_iter()
                 .map(|text| vt::Cell { text: text.into(), ..Default::default() }).collect();
-            let ops = row_ops(&row, cell_size(window), None, window);
+            let ops = row_ops(&row, cell_size(window), None, 1.0, window);
             let text: Vec<_> = ops.iter().filter_map(|op| match op {
                 RowOp::Text { x, line } => Some((*x, line.font_size)),
                 _ => None,
@@ -3888,7 +3918,7 @@ mod tests {
             }
             for text in ["🕹\u{fe0f}", "🖥\u{fe0f}", "🌡\u{fe0f}"] {
                 let row = [vt::Cell { text: text.into(), wide: true, ..Default::default() }];
-                for op in row_ops(&row, cell_size(window), None, window) {
+                for op in row_ops(&row, cell_size(window), None, 1.0, window) {
                     if let RowOp::Text { line, .. } = op { assert_eq!(line.font_size, px(24.)); }
                 }
             }
@@ -3932,7 +3962,7 @@ mod tests {
         window.update(cx, |_, window, _| {
             for (text, wide) in [("\u{3000}", true), ("\u{a0}", false), ("\u{2003}", false)] {
                 let row = [vt::Cell { text: text.into(), wide, ..Default::default() }, vt::Cell::default()];
-                let ops = row_ops(&row, size(px(8.), px(16.)), None, window);
+                let ops = row_ops(&row, size(px(8.), px(16.)), None, 1.0, window);
                 let runs: Vec<_> = ops.iter().filter_map(|op| match op {
                     RowOp::Text { x, line } => Some((*x, line.text.as_ref())),
                     _ => None,
@@ -3942,7 +3972,7 @@ mod tests {
             for text in ["", " ", "   "] {
                 for (underline, strike) in [(false, false), (true, false), (false, true)] {
                     let row = [vt::Cell { text: text.into(), underline: underline.then_some(vt::Underline::Single), strike, ..Default::default() }];
-                    let ops = row_ops(&row, size(px(8.), px(16.)), None, window);
+                    let ops = row_ops(&row, size(px(8.), px(16.)), None, 1.0, window);
                     assert_eq!(ops.iter().filter(|op| matches!(op, RowOp::Text { .. })).count(), usize::from(underline || strike));
                 }
             }
@@ -3958,7 +3988,7 @@ mod tests {
             let (fg, red, blue) = (Rgb(200, 200, 200), Rgb(255, 0, 0), Rgb(0, 0, 255));
             let cell = |text: &str, underline, underline_color| vt::Cell { text: text.into(), fg, underline, underline_color, ..Default::default() };
             let decorations = |row: &[vt::Cell], window: &mut Window| -> Vec<_> {
-                row_ops(row, size(px(8.), px(16.)), None, window).iter().filter_map(|op| match op {
+                row_ops(row, size(px(8.), px(16.)), None, 1.0, window).iter().filter_map(|op| match op {
                     RowOp::Decoration { from, to, underline, strike } => Some((*from, *to, *underline, *strike)),
                     _ => None,
                 }).collect()
@@ -3997,7 +4027,7 @@ mod tests {
         row[2].bg = Some(vt::Rgb(10, 20, 30));
         let window = cx.add_window(|_, _| Empty);
         window.update(cx, |_, window, _| {
-            let ops = row_ops(&row, size(px(8.), px(16.)), None, window);
+            let ops = row_ops(&row, size(px(8.), px(16.)), None, 1.0, window);
             let runs: Vec<_> = ops.iter().filter_map(|op| match op {
                 RowOp::Text { x, line } => Some((*x, line.text.as_ref())),
                 _ => None,
@@ -4023,7 +4053,7 @@ mod tests {
                 (Some(1), vec![(0, "a"), (1, "="), (2, ">b")]),
                 (Some(2), vec![(0, "a="), (2, ">"), (3, "b")]),
             ] {
-                let ops = row_ops(&row, size(px(8.), px(16.)), cursor, window);
+                let ops = row_ops(&row, size(px(8.), px(16.)), cursor, 1.0, window);
                 let runs: Vec<_> = ops.iter().filter_map(|op| match op {
                     RowOp::Text { x, line } => Some((*x, line.text.as_ref())),
                     _ => None,
@@ -4159,7 +4189,7 @@ mod tests {
         let window = cx.add_window(|_, _| Empty);
 
         window.update(cx, |_, window, _| {
-            let ops = row_ops(&vt.frame().rows[0], size(px(8.), px(16.)), None, window);
+            let ops = row_ops(&vt.frame().rows[0], size(px(8.), px(16.)), None, 1.0, window);
             let runs: Vec<_> = ops.iter().filter_map(|op| match op {
                 RowOp::Text { x, line } => Some((*x, line.text.as_ref())),
                 _ => None,
@@ -4183,7 +4213,7 @@ mod tests {
                 settings.font_size = font_size;
                 settings.zoom = zoom;
                 crate::settings::set(settings);
-                let ops = row_ops(&vt.frame().rows[0], size(px(8.), px(16.)), None, window);
+                let ops = row_ops(&vt.frame().rows[0], size(px(8.), px(16.)), None, 1.0, window);
                 let runs: Vec<_> = ops.iter().filter_map(|op| match op {
                     RowOp::Text { x, line } => Some((*x, line.text.as_ref())),
                     _ => None,
@@ -4213,7 +4243,7 @@ mod tests {
                         let row: Vec<_> = text.chars().map(|c| crate::vt::Cell {
                             text: c.to_string(), underline: underline.then_some(crate::vt::Underline::Single), strike, ..Default::default()
                         }).collect();
-                        let ops = super::row_ops(&row, gpui::size(gpui::px(8.0), gpui::px(16.0)), None, window);
+                        let ops = super::row_ops(&row, gpui::size(gpui::px(8.0), gpui::px(16.0)), None, 1.0, window);
                         let rendered: String = ops.iter().filter_map(|op| match op {
                             super::RowOp::Text { line, .. } => Some(line.text.as_ref()),
                             _ => None,
@@ -4243,7 +4273,7 @@ mod tests {
                     let row: Vec<_> = text.chars().map(|c| crate::vt::Cell {
                         text: c.to_string(), bold, italic, ..Default::default()
                     }).collect();
-                    let ops = super::row_ops(&row, gpui::size(gpui::px(8.0), gpui::px(16.0)), None, window);
+                    let ops = super::row_ops(&row, gpui::size(gpui::px(8.0), gpui::px(16.0)), None, 1.0, window);
                     assert_eq!(ops.len(), 1, "{text:?}");
                     let super::RowOp::Text { x, line } = &ops[0] else { panic!("configured font was bypassed") };
                     assert_eq!(*x, 0);
@@ -4261,7 +4291,7 @@ mod tests {
                 let text = char::from_u32(code).unwrap().to_string();
                 for decorated in [false, true] {
                     let row = [crate::vt::Cell { text: text.clone(), underline: decorated.then_some(crate::vt::Underline::Single), strike: decorated, ..Default::default() }];
-                    let ops = super::row_ops(&row, gpui::size(gpui::px(8.0), gpui::px(16.0)), None, window);
+                    let ops = super::row_ops(&row, gpui::size(gpui::px(8.0), gpui::px(16.0)), None, 1.0, window);
                     assert_eq!(ops.iter().filter(|op| !matches!(op, super::RowOp::Decoration { .. })).count(), 1, "U+{code:X}");
                     match &ops[0] {
                         super::RowOp::Text { x, line } => { assert_eq!(*x, 0); assert_eq!(line.text.as_ref(), text); }
