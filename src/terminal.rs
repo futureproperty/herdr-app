@@ -82,6 +82,8 @@ pub enum TerminalEvent {
     ContextMenu(Point<Pixels>),
     /// Something the person asked for failed: an error toast.
     Notice { title: String, body: String },
+    /// The background behind the top row changed, so framed chrome can follow it.
+    BackgroundChanged,
 }
 
 /// Rows of scrollback history as Ghostty's scrollbar reports them. `from_bottom`
@@ -124,6 +126,7 @@ struct Grid {
     vt_cell: (u32, u32),
     /// The colors and device-pixel cell size the core was last told.
     told_display: Option<DisplayFacts>,
+    last_bg: Option<Rgb>,
     /// Top-left of the cell grid in window coordinates, from the last paint.
     origin: Point<Pixels>,
     buttons_down: Vec<MouseButton>,
@@ -320,6 +323,7 @@ impl TerminalView {
                 scale: 1.0,
                 vt_cell: (9, 18),
                 told_display: None,
+                last_bg: None,
                 origin: Point::default(),
                 buttons_down: Vec::new(),
                 images: HashMap::new(),
@@ -646,6 +650,11 @@ impl TerminalView {
     /// Sizes a terminal that isn't on screen as its pane would be (`AppWindow::fit_hidden_tabs`).
     pub fn fit(&self, cols: u16, rows: u16, cell: Size<Pixels>, scale: f32) {
         self.grid.borrow_mut().fit(cols, rows, cell, scale);
+    }
+
+    /// The background the terminal itself shows (a program may set its own).
+    pub fn background(&self) -> Option<Rgb> {
+        self.grid.borrow().last_bg
     }
 
     pub fn on_screen_this_frame(&self) -> bool {
@@ -2076,6 +2085,46 @@ fn row_decorations(row: &[vt::Cell], dim: f32, ops: &mut Vec<RowOp>) {
     }
 }
 
+/// The TUI's own canvas color, when it covers enough of the screen to stand in
+/// for the theme background in newly expanded cells.
+fn dominant_canvas_bg(painted: &[(Rc<Vec<vt::Cell>>, Vec<RowOp>, Option<usize>)], theme_bg: Rgb) -> Option<Rgb> {
+    let total_rows = painted.len();
+    let total_cells: usize = painted.iter().map(|(row, _, _)| row.len()).sum();
+    if total_cells == 0 || total_rows == 0 {
+        return None;
+    }
+    struct Seen {
+        color: Rgb,
+        cells: usize,
+        rows: usize,
+        last_row: Option<usize>,
+    }
+    let mut seen: Vec<Seen> = Vec::new();
+    for (y, (row, ops, _)) in painted.iter().enumerate() {
+        for op in ops {
+            let RowOp::Bg { from, to, .. } = op else { continue };
+            let Some(color) = row.get(*from).and_then(|cell| cell.bg) else { continue };
+            if color == theme_bg {
+                continue;
+            }
+            let cells = to.saturating_sub(*from);
+            if let Some(entry) = seen.iter_mut().find(|entry| entry.color == color) {
+                entry.cells += cells;
+                if entry.last_row != Some(y) {
+                    entry.rows += 1;
+                    entry.last_row = Some(y);
+                }
+            } else if seen.len() < 16 {
+                seen.push(Seen { color, cells, rows: 1, last_row: Some(y) });
+            }
+        }
+    }
+    seen.into_iter()
+        .filter(|entry| entry.cells * 4 >= total_cells && entry.rows * 5 >= total_rows * 2)
+        .max_by_key(|entry| entry.cells)
+        .map(|entry| entry.color)
+}
+
 /// The find field's editor colors, following the theme at open time.
 fn find_input_style() -> InputEditorStyle {
     InputEditorStyle {
@@ -2089,18 +2138,16 @@ fn find_input_style() -> InputEditorStyle {
     }
 }
 
-fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, window: &mut Window, cx: &mut App) {
+fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, view: &WeakEntity<TerminalView>, window: &mut Window, cx: &mut App) {
     crate::bench::count(&crate::bench::GRID);
     let dim = if focused { 1.0 } else { UNFOCUSED_DIM };
     let mut g = grid.borrow_mut();
     let cell = g.cell;
     let metrics = cell_metrics(window);
     let (pad_x, pad_y) = pad();
-    // Rows rarely fill the height exactly: split what's left above and below.
-    let spare = (f32::from(bounds.size.height) - 2.0 * pad_y - f32::from(cell.height) * g.vt.rows as f32).max(0.0);
     let scale = window.scale_factor();
     let snap = |v: Pixels| px((f32::from(v) * scale).round() / scale);
-    let origin = bounds.origin + point(px(pad_x), px(pad_y + (spare / 2.0).floor()));
+    let origin = bounds.origin + point(px(pad_x), px(pad_y));
     let origin = point(snap(origin.x), snap(origin.y));
     g.origin = origin;
     let frame = g.vt.frame();
@@ -2149,8 +2196,6 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
             }
         }
     };
-    paint_images(true, window);
-
     // Each row's drawing is built once and painted again while the row is the
     // same (`Vt::frame` keeps a row libghostty didn't change): an agent's spinner
     // line rebuilds one row, not the whole screen.
@@ -2177,10 +2222,59 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
         }
     }
 
+    // A title bar takes the ground the program draws on: the widest run of one
+    // background in a row. A run under half the row is a badge, a selection or
+    // one reverse-video cell, not that ground, so it is skipped.
+    let widest_bg = |row: &[vt::Cell], ops: &[RowOp]| {
+        let half = row.len() as f32 / 2.0;
+        ops.iter()
+            .filter_map(|op| match op {
+                RowOp::Bg { from, to, .. } if (*to - *from) as f32 >= half => {
+                    row.get(*from).and_then(|cell| cell.bg).map(|color| ((*to - *from) as f32, color))
+                }
+                _ => None,
+            })
+            .fold(None::<(f32, Rgb)>, |best, this| match best {
+                Some(best) if best.0 >= this.0 => Some(best),
+                _ => Some(this),
+            })
+            .map(|(_, color)| color)
+    };
+    let top = painted.first().and_then(|(row, ops, _)| widest_bg(row.as_slice(), ops));
+    let backdrop = dominant_canvas_bg(&painted, frame.bg).unwrap_or(frame.bg);
+    let next_bg = Some(top.unwrap_or(backdrop));
+    let changed = {
+        let mut g = grid.borrow_mut();
+        let changed = g.last_bg != next_bg;
+        g.last_bg = next_bg;
+        changed
+    };
+    if changed {
+        let bg_view = view.clone();
+        window.defer(cx, move |_, cx| {
+            let _ = bg_view.update(cx, |_, cx| cx.emit(TerminalEvent::BackgroundChanged));
+        });
+    }
+
+    if backdrop != frame.bg {
+        window.paint_quad(fill(bounds, hsla(backdrop).opacity(crate::settings::get().terminal_opacity)));
+    }
+    paint_images(true, window);
+
+    let grid_bottom = origin.y + cell.height * painted.len() as f32;
+    let fill_slack = |window: &mut Window, from: Pixels, to: Pixels, color: Option<Rgb>| {
+        if to > from {
+            let b = Bounds::new(point(bounds.origin.x, from), size(bounds.size.width, to - from));
+            window.paint_quad(fill(b, hsla(color.unwrap_or(backdrop))));
+        }
+    };
+    fill_slack(window, bounds.origin.y, origin.y, top);
+    fill_slack(window, grid_bottom, bounds.bottom(), painted.last().and_then(|(row, ops, _)| widest_bg(row.as_slice(), ops)));
+
     // Paint all program backgrounds first, then search overlays, then text.
     // This lets a match highlight sit below glyphs without contaminating
     // cached RowOps or the terminal's own selection/copy state.
-    for (y, (_, ops, _)) in painted.iter().enumerate() {
+    for (y, (row, ops, _)) in painted.iter().enumerate() {
         for op in ops {
             match op {
                 RowOp::Bg { from, to, color } => {
@@ -2189,6 +2283,11 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
                 }
                 _ => {}
             }
+        }
+        let right = origin.x + cell.width * row.len() as f32;
+        if right < bounds.right() {
+            let b = Bounds::new(point(right, origin.y + cell.height * y as f32), size(bounds.right() - right, cell.height));
+            window.paint_quad(fill(b, hsla(row.last().and_then(|c| c.bg).unwrap_or(backdrop))));
         }
     }
     for selected in [false, true] {
@@ -2597,7 +2696,7 @@ impl Render for TerminalView {
                         grid.borrow_mut().fit(cols, rows, cell, window.scale_factor());
                     },
                     move |bounds, _, window, cx| {
-                        paint_grid(bounds, &grid_paint, focused, window, cx);
+                        paint_grid(bounds, &grid_paint, focused, &selection_view, window, cx);
                         let view = selection_view.clone();
                         window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
                             if phase == DispatchPhase::Capture {
@@ -2944,6 +3043,35 @@ mod tests {
             assert_eq!(bg.a, 1.0, "cell backgrounds must stay fully opaque");
             assert_eq!(fg.a, UNFOCUSED_DIM, "foreground colors must use the unfocused dim factor");
         }).unwrap();
+    }
+
+    #[test]
+    fn dominant_canvas_bg_ignores_sparse_prompt_backgrounds() {
+        use super::*;
+
+        let theme = vt::Rgb(8, 9, 10);
+        let tui = vt::Rgb(24, 30, 36);
+        let painted = |cols: usize, rows: usize, bg_cols: usize, bg_rows: usize| {
+            (0..rows).map(|y| {
+                let mut cells: Vec<vt::Cell> = (0..cols).map(|_| vt::Cell::default()).collect();
+                if y < bg_rows {
+                    for c in cells.iter_mut().take(bg_cols) {
+                        c.bg = Some(tui);
+                    }
+                }
+                let ops = if y < bg_rows && bg_cols > 0 {
+                    vec![RowOp::Bg { from: 0, to: bg_cols, color: hsla(tui) }]
+                } else {
+                    Vec::new()
+                };
+                (Rc::new(cells), ops, None)
+            }).collect::<Vec<_>>()
+        };
+
+        let dominant = painted(10, 5, 7, 2);
+        assert_eq!(dominant_canvas_bg(&dominant, theme), Some(tui), "28% of cells across 40% of rows is a TUI canvas");
+        let sparse = painted(10, 5, 7, 1);
+        assert_eq!(dominant_canvas_bg(&sparse, theme), None, "a prompt highlight on one row is not a canvas");
     }
 
     #[gpui::test]

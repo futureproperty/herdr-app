@@ -1590,6 +1590,7 @@ impl AppWindow {
                 TerminalEvent::Peek(address) => this.peek_terminal(address, window, cx),
                 TerminalEvent::Link(click) => this.handle_link(&block, &addr, click, window, cx),
                 TerminalEvent::TitleChanged => this.publish(cx),
+                TerminalEvent::BackgroundChanged => cx.notify(),
                 TerminalEvent::ScrollChanged => {
                     mods::panes_scrolled();
                     this.refresh_snapshot_mods(cx);
@@ -4604,6 +4605,15 @@ impl AppWindow {
                 div().size_full().flex().opacity(if on { 1.0 } else { crate::terminal::UNFOCUSED_DIM })
                     .child(self.render_slot(&format!("{}#frame", n.id), cx)),
             );
+        let head = match self.terms.get(&n.id).and_then(|t| t.view.read(cx).background()) {
+            Some(bg) => head.bg(crate::terminal::hsla(bg)),
+            None => head,
+        };
+        let head = if self.titlebar() == crate::layout::Titlebar::Layout && !h.hover() && !h.bottom() {
+            self.window_drag(head, cx)
+        } else {
+            head
+        };
         if h.hover() {
             let head = head.absolute().left_0().right_0().opacity(0.).group_hover(group, |s| s.opacity(1.));
             let head = if h.bottom() { head.bottom_0() } else { head.top_0() };
