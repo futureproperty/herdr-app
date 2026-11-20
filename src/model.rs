@@ -92,6 +92,9 @@ pub struct Model {
     seq: u64,
     /// Where each terminal works now: its repo (worktrees included) and branch.
     pub folder_info: HashMap<String, FolderInfo>,
+    /// Spaces shown before, most recent last (this session): closing the shown one
+    /// goes back to it.
+    before: Vec<String>,
 }
 
 /// Herdr's attention priority: blocked > done > working > idle > nothing.
@@ -164,8 +167,31 @@ impl Space {
 
     fn select(&mut self, ctx: &str) {
         if self.tab(ctx).is_some() {
-            self.active = Some(ctx.to_owned());
+            self.shown(ctx);
         }
+    }
+
+    /// Tabs shown before, most recent last. Kept in `rest`, a document field
+    /// this build doesn't read, so it needs no field of its own and the
+    /// document carries it back, as a newer build's fields are.
+    fn before(&self) -> Vec<String> {
+        self.rest.get("local.before").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default()
+    }
+
+    fn set_before(&mut self, ids: Vec<String>) {
+        self.rest.insert("local.before".into(), serde_json::json!(ids));
+    }
+
+    /// Shows `ctx`, remembering the tab that was shown before it.
+    fn shown(&mut self, id: &str) {
+        if let Some(prev) = self.active.clone().filter(|prev| prev != id) {
+            let mut before = self.before();
+            before.retain(|t| t != &prev);
+            before.push(prev);
+            before.truncate(32);
+            self.set_before(before);
+        }
+        self.active = Some(id.to_owned());
     }
 }
 
@@ -221,6 +247,16 @@ impl Model {
     pub fn active_index(&self) -> Option<usize> {
         let id = self.active.as_deref()?;
         self.spaces.iter().position(|p| p.id == id).or((!self.spaces.is_empty()).then_some(0))
+    }
+
+    /// Shows a space, remembering the one shown before it.
+    pub fn show_space(&mut self, id: &str) {
+        if let Some(prev) = self.active.clone().filter(|prev| prev != id) {
+            self.before.retain(|s| s != &prev);
+            self.before.push(prev);
+            self.before.truncate(32);
+        }
+        self.active = Some(id.to_owned());
     }
 
     pub fn active_space(&self) -> Option<&Space> {
@@ -302,7 +338,7 @@ impl Model {
         self.spaces.push(Space { id: id.to_owned(), name: name.to_owned(), folder: folder.to_owned(), machine: None, tabs: vec![ctx], active, rest: Default::default() });
         self.recent.retain(|r| r.name != name);
         if show {
-            self.active = Some(id.to_owned());
+            self.show_space(id);
         }
     }
 
@@ -323,8 +359,9 @@ impl Model {
             return true;
         }
         let at = p.active.as_deref().and_then(|a| p.tabs.iter().position(|c| c.id == a)).map_or(p.tabs.len(), |i| i + 1);
-        p.active = Some(ctx.id.clone());
+        let id = ctx.id.clone();
         p.tabs.insert(at, ctx);
+        p.shown(&id);
         true
     }
 
@@ -428,8 +465,11 @@ impl Model {
         let ci = p.tabs.iter().position(|c| c.id == ctx).unwrap();
         let removed = p.tabs.remove(ci);
         if p.active.as_deref() == Some(ctx) {
-            // The tab that slides into the slot, or the last one.
-            p.active = p.tabs.get(ci).or(p.tabs.last()).map(|c| c.id.clone());
+            // The tab shown before it, else the one that slid into the slot, else the last.
+            let before = p.before();
+            p.active = before.iter().rev().find(|id| p.tabs.iter().any(|c| &c.id == *id)).cloned()
+                .or_else(|| p.tabs.get(ci).or(p.tabs.last()).map(|c| c.id.clone()));
+            p.set_before(before.into_iter().filter(|id| id != ctx).collect());
         }
         let closed = p.tabs.is_empty();
         if closed {
@@ -448,7 +488,11 @@ impl Model {
         self.recent.insert(0, Recent { name: p.name.clone(), folder: p.folder.clone() });
         self.recent.truncate(20);
         if was_active {
-            self.active = self.spaces.get(pi).or(self.spaces.last()).map(|p| p.id.clone());
+            // The space shown before it, else the one that slid into the slot, else the last.
+            let before = std::mem::take(&mut self.before);
+            self.active = before.iter().rev().find(|id| self.spaces.iter().any(|p| &p.id == *id)).cloned()
+                .or_else(|| self.spaces.get(pi).or(self.spaces.last()).map(|p| p.id.clone()));
+            self.before = before.into_iter().filter(|id| *id != p.id).collect();
         }
         p.tabs.iter().flat_map(|c| addresses(&c.root)).collect()
     }
@@ -461,8 +505,9 @@ impl Model {
     /// Selects a tab and its space. Shown again, a settled tab is back.
     pub fn select_tab(&mut self, ctx: &str) -> bool {
         let Some(p) = self.spaces.iter_mut().find(|p| p.tab(ctx).is_some()) else { return false };
+        let id = p.id.clone();
         p.select(ctx);
-        self.active = Some(p.id.clone());
+        self.show_space(&id);
         self.unsettle(ctx);
         true
     }
@@ -860,6 +905,29 @@ mod tests {
         assert_eq!(m.active_tab().map(|c| c.id.as_str()), Some("c2"));
         m.select_tab("c1");
         assert_eq!(m.tab("c1").unwrap().settled, None);
+    }
+
+    #[test]
+    fn closing_the_shown_tab_goes_back_to_the_one_shown_before() {
+        let mut m = model_with_one();
+        m.add_tab("p1", Tab::new("c2", "docs", "x2", "t2"));
+        m.add_tab("p1", Tab::new("c3", "logs", "x3", "t3"));
+        m.select_tab("c1");
+        m.select_tab("c3");
+        m.remove_tab("c3");
+        assert_eq!(m.active_tab().map(|c| c.id.as_str()), Some("c1"));
+    }
+
+    #[test]
+    fn closing_the_shown_space_goes_back_to_the_one_shown_before() {
+        let mut m = Model::default();
+        m.add_space("p1", "api", "/a", Tab::new("c1", "one", "x1", "t1"));
+        m.add_space("p2", "web", "/b", Tab::new("c2", "two", "x2", "t2"));
+        m.add_space("p3", "logs", "/c", Tab::new("c3", "three", "x3", "t3"));
+        m.show_space("p1");
+        m.show_space("p3");
+        m.remove_space("p3");
+        assert_eq!(m.active.as_deref(), Some("p1"));
     }
 
     #[test]
