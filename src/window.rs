@@ -9,6 +9,7 @@ mod floats;
 mod movable;
 mod pane_drag;
 mod pane_size;
+mod slides;
 mod titlebar;
 
 use crate::layout::{Axis, Background as Paint, Content, Divider, Fit, HeaderContent, Kind, Line, Node, PaneFrame, Size as Span};
@@ -413,6 +414,7 @@ pub struct AppWindow {
     model: Model,
     /// Terminal views by block id (panes and chrome terminal blocks).
     terms: HashMap<String, Term>,
+    slides: slides::Slides,
     /// Mod copies by slot (block id, `<stack>#header`, or `overlay:<id>`).
     copies: HashMap<String, Copy>,
     overlays: Vec<Overlay>,
@@ -547,6 +549,7 @@ impl AppWindow {
             divider_window_hovered: true,
             model: Model::default(),
             terms: HashMap::new(),
+            slides: slides::Slides::default(),
             copies: HashMap::new(),
             overlays: Vec::new(),
             toast_scroll: ScrollHandle::new(),
@@ -1095,13 +1098,17 @@ impl AppWindow {
                 }
             }
         };
+        let other = next != self.layout_name;
+        self.finish_all_slides(cx);
         self.save();
+        if other {
+            self.slides.saved_px.clear();
+        }
         self.float_drag = None;
         self.pane_drag = None;
         self.float_anims.clear();
         self.float_reveal.clear();
         self.float_hover.clear();
-        let other = next != self.layout_name;
         if other {
             self.close_windows(window, cx);
             self.drop_layout_copies(window, cx);
@@ -1183,6 +1190,10 @@ impl AppWindow {
             return;
         }
         self.note_pane_folders();
+        if self.has_chrome_slide() {
+            self.save_view();
+            return;
+        }
         let mut state = layout_sync::State::between(&self.file_chrome, &self.chrome);
         state.theme = self.picked_theme.clone();
         if self.layout_file_ok {
@@ -1558,6 +1569,10 @@ impl AppWindow {
         self.enroll_link_handlers();
         self.refresh_link_handlers();
         self.model.order_spaces();
+        let gone: Vec<String> = self.slides.closing_panes.iter().filter(|p| self.model.tab_of(p).is_none()).cloned().collect();
+        for p in &gone {
+            self.slides.closing_panes.remove(p);
+        }
         let (model, live) = (&self.model, &self.live);
         self.swapped.retain(|p, a| model.address_of(p).is_some() && live.contains_key(a));
         let (mut terms, mods_visible) = self.visible();
@@ -2606,7 +2621,7 @@ impl AppWindow {
                 return self.sync(window, cx);
             }
             if closed && self.model.address_of(block).as_deref() == Some(t.address.as_str()) {
-                self.model.remove_pane(block);
+                self.close_pane_on_its_own(block, window, cx);
                 return self.sync(window, cx);
             }
         }
@@ -2786,8 +2801,16 @@ impl AppWindow {
         let new = self.model.fresh_id_on("p", on.as_deref());
         let mut root = self.model.tab(&ctx).expect("target tab").root.clone();
         root.split(&target, axis, Node::block(new.clone(), Content::Terminal { terminal: String::new() }), "initial-size".into());
+        // The slide evens the split pane's siblings out, so the terminal starts
+        // at the size it will settle to: a shell on a slow (remote) machine
+        // would otherwise draw its prompt at the smaller share and draw again,
+        // a line lower, once the slide's resize reaches it.
+        crate::model::even_siblings(&mut root, &new);
         let size = self.model.active_tab().filter(|tab| tab.id == ctx)
             .and_then(|_| self.initial_size(&root, &new, window));
+        let size = size.filter(|&(c, r)| c >= 12 && r >= 3).or_else(|| {
+            self.model.tab(&ctx).and_then(|t| self.shown_size(t, &new, window)).filter(|&(c, r)| c >= 12 && r >= 3)
+        });
         let (addr, _) = self.spawn(argv, cwd, follow, &space, &ctx, on.as_deref(), size, window)?;
         self.model.split(&target, axis, &new, &addr);
         Ok(json!({ "pane": new, "terminal": addr }))
@@ -2843,7 +2866,7 @@ impl AppWindow {
                 };
                 if closed {
                     self.notify_launch_failure(&addr, window, cx);
-                    self.model.remove_pane(&pane);
+                    self.close_pane_on_its_own(&pane, window, cx);
                     changed = true;
                 }
             }
@@ -2956,7 +2979,7 @@ impl AppWindow {
                 if let Some(pane) = self.model.pane_of(&address) { self.model.focus_pane(&pane); }
             }
             TerminalChange::Park => {
-                if let Some(pane) = self.model.pane_of(&address) { self.model.remove_pane(&pane); }
+                if let Some(pane) = self.model.pane_of(&address) { self.close_pane_on_its_own(&pane, window, cx); }
             }
         }
         if !self.draining {
@@ -3325,6 +3348,11 @@ impl AppWindow {
                     Some(name) => self.split_mod(Self::owned(a, "pane"), axis, name, a.get("props").cloned().unwrap_or(Value::Null)),
                     None => self.split(Self::owned(a, "pane"), axis, Self::argv(a), None, window),
                 };
+                if let Ok(v) = &r
+                    && let Some(pane) = v.get("pane").and_then(Value::as_str)
+                {
+                    self.slides.pending_split = Some(pane.to_owned());
+                }
                 self.answer(r);
             }
             "pane.close" => {
@@ -3337,13 +3365,14 @@ impl AppWindow {
                     let id = c.id.clone();
                     return self.dispatch("tab.close", &json!({ "id": id }), person, window, cx);
                 }
-                let addr = self.model.address_of(&pane);
-                self.model.remove_pane(&pane);
-                self.close_terminals(addr.into_iter().collect(), cx);
+                if self.slide_close(&pane, false, window, cx) {
+                    return;
+                }
+                self.close_pane_now(&pane, cx);
             }
             "pane.zoom" => {
                 if let Some(pane) = Self::owned(a, "pane").or_else(|| self.model.focused_pane()) {
-                    self.model.toggle_zoom(&pane);
+                    self.slide_zoom(&pane, window, cx);
                 }
             }
             "pane.focus" => {
@@ -3643,6 +3672,11 @@ impl AppWindow {
             },
             "layout.toggle" | "layout.show" | "layout.hide" => {
                 let id = Self::arg(a, "id").unwrap_or_default();
+                if a.get("slide").and_then(Value::as_bool).unwrap_or(false) {
+                    self.slide_chrome_node(id, name, window, cx);
+                    return;
+                }
+                self.finish_slide(&format!("chrome:{id}"), cx);
                 let Some(n) = self.chrome.find_mut(id) else { return self.fail(format!("no node {id:?} in the shown layout")) };
                 n.hidden = match name {
                     "layout.toggle" => !n.hidden,
@@ -3812,6 +3846,9 @@ impl AppWindow {
             }
         }
         self.sync(window, cx);
+        if let Some(pane) = self.slides.pending_split.take() {
+            self.slide_split_in(&pane, window, cx);
+        }
     }
 
     fn find_node_mut(&mut self, id: &str) -> Option<&mut Node> {
@@ -7288,9 +7325,14 @@ mod tests {
         cx.update(|window, cx| view.update(cx, |this, cx| {
             assert_eq!(this.model.focused_pane().as_deref(), Some("pa"), "a click goes through the veil");
             assert_eq!((this.veil(Some(0.5), "pa"), this.veil(Some(0.5), "pb")), (None, Some(0.5)));
-            // Zooming the other pane selects it: it's the one drawn.
+            // Zooming the other pane selects it at once, while the zoom itself
+            // lands when the slide ends: until then the growing pane is the
+            // selected one and the other is veiled like any unselected pane.
             this.run("pane.zoom", json!({ "pane": "pb" }), window, cx);
-            assert_eq!(this.model.focused_pane().as_deref(), Some("pb"));
+            assert_eq!(this.model.focused_pane().as_deref(), Some("pb"), "zooming focuses at once");
+            assert_eq!(this.model.active_tab().and_then(|c| c.zoomed.clone()), None, "the zoom lands when the slide ends");
+            assert_eq!((this.veil(Some(0.5), "pa"), this.veil(Some(0.5), "pb")), (Some(0.5), None), "the pane that shrinks is still veiled");
+            this.finish_all_slides(cx);
             assert_eq!((this.veil(Some(0.5), "pa"), this.veil(Some(0.5), "pb")), (None, None), "a zoomed tab isn't veiled");
         }));
     }
@@ -7694,6 +7736,7 @@ export default class Probe extends View {
     }
 
     include!("window/pane_size_tests.rs");
+    include!("window/slides_tests.rs");
 
     /// What a `{"command":"tab.move","args":{"by":-1}}` key runs.
     #[test]

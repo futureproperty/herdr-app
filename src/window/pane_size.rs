@@ -155,15 +155,26 @@ impl AppWindow {
         self.displayed_size(tab.shown(), tab.root.panes().len(), pane, &focused, window)
     }
 
+    /// The grid `pane` gets when it is zoomed inside `tab` (preserving the tab's pane count for framing).
+    pub(super) fn zoomed_size(&self, tab: &Tab, pane: &str, window: &Window) -> Option<(u16, u16)> {
+        let node = tab.root.find(pane)?;
+        let focused = HashSet::from([pane.to_owned()]);
+        self.displayed_size(node, tab.root.panes().len(), pane, &focused, window)
+    }
+
     /// `shown`: the tree on screen; `panes`: how many the tab has (its frame needs more than one, or `lone`).
     fn displayed_size(&self, shown: &Node, panes: usize, pane: &str, focused: &HashSet<String>, window: &Window) -> Option<(u16, u16)> {
-        let (context, area) = self.context_area()?;
+        let (_, area) = self.context_area()?;
+        self.size_in(shown, panes, pane, area, focused, window)
+    }
+
+    pub(super) fn size_in(&self, shown: &Node, panes: usize, pane: &str, area: Size<Pixels>, focused: &HashSet<String>, window: &Window) -> Option<(u16, u16)> {
+        let context = self.chrome.visible_blocks().into_iter().find(|n| matches!(n.content(), Some(Content::Context { .. })))?;
         let frame = match context.content() {
             Some(Content::Context { pane: Some(frame), .. }) if frame.lone || panes > 1 => Some(frame),
             _ => None,
         };
         let zoom = settings::zoom();
-        // The absolute bounds canvas already excludes the context border (padding box).
         let (y, x) = padding(context);
         let size = inset(area, 2.0 * x * zoom, 2.0 * y * zoom);
         let size = pane_size(shown, size, pane, frame, focused, zoom)?;
@@ -195,11 +206,22 @@ impl AppWindow {
         (size.width > px(0.0) && size.height > px(0.0)).then_some((context, size))
     }
 
+    /// The area the tab block would get if `chrome` were laid out right now.
+    pub(super) fn context_area_for(&self, chrome: &Node) -> Option<Size<Pixels>> {
+        let root_size = self.bounds.borrow().get(&chrome.id)?.size;
+        if root_size.width <= px(0.0) || root_size.height <= px(0.0) {
+            return None;
+        }
+        let context = chrome.visible_blocks().into_iter().find(|n| matches!(n.content(), Some(Content::Context { .. })))?;
+        let bounds = block_bounds(chrome, Bounds::new(Point::default(), root_size), &context.id, None, &HashSet::new(), settings::zoom())?;
+        (bounds.size.width > px(0.0) && bounds.size.height > px(0.0)).then_some(bounds.size)
+    }
+
     /// Terminals in hidden tabs keep the size they last had on screen, so a tab shown
     /// after the window changed size draws its old screens, then jumps once the programs
     /// redraw. Once the window settles (the same at two ticks), they are sized as their
     /// panes would be, so the programs redraw out of sight.
-    pub(super) fn fit_hidden_tabs(&mut self, window: &Window, cx: &App) {
+    pub(super) fn fit_hidden_tabs(&mut self, window: &Window, cx: &mut App) {
         let Some((_, area)) = self.context_area() else { return };
         let cell = crate::terminal::cell_size(window);
         let now = (area, cell);
@@ -218,7 +240,7 @@ impl AppWindow {
                 if let Some(t) = self.terms.get(&pane.id)
                     && let Some((cols, rows)) = self.shown_size(tab, &pane.id, window)
                 {
-                    t.view.read(cx).fit(cols, rows, cell, scale);
+                    t.view.update(cx, |v, _| v.fit(cols, rows, cell, scale));
                 }
             }
         }

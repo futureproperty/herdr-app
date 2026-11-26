@@ -117,6 +117,24 @@ fn push_recent(list: &mut Vec<String>, id: String) {
     }
 }
 
+/// Evens the shares in the row or column holding `pane`: every visible,
+/// non-fixed sibling gets weight one.
+pub fn even_siblings(root: &mut Node, pane: &str) {
+    let Some(parent) = root.parent_of(pane).map(|p| p.id.clone()) else { return };
+    let Some(p) = root.find(&parent) else { return };
+    let ids: Vec<String> = p.children().iter().filter(|n| !n.hidden).map(|n| n.id.clone()).collect();
+    if ids.len() < 2 {
+        return;
+    }
+    for id in ids {
+        if let Some(n) = root.find_mut(&id)
+            && !matches!(n.size, Some(crate::layout::Size::Px { .. }))
+        {
+            n.size = Some(crate::layout::Size::Weight { weight: 1.0 });
+        }
+    }
+}
+
 impl Tab {
     /// A tab with one terminal pane.
     pub fn new(id: &str, name: &str, pane_id: &str, address: &str) -> Tab {
@@ -448,6 +466,27 @@ impl Model {
         let id = c.id.clone();
         let (_, space_closed) = self.remove_tab(&id);
         (true, space_closed)
+    }
+
+    /// Removes a pane the way a hand closes it: the pane takes its share with
+    /// it, so the panes left in a row share it evenly (a third of three closes
+    /// to a half of two). A program exiting, or a terminal being parked, comes
+    /// here: `remove_pane` alone hands the share to one neighbor, which is what
+    /// a slide-close undoes first.
+    pub fn remove_pane_evenly(&mut self, pane_id: &str) -> (bool, bool) {
+        let siblings: Vec<String> = self
+            .tab_of(pane_id)
+            .and_then(|c| c.root.parent_of(pane_id))
+            .map(|p| p.children().iter().filter(|n| n.id != pane_id && !n.hidden).map(|n| n.id.clone()).collect())
+            .unwrap_or_default();
+        let out = self.remove_pane(pane_id);
+        if siblings.len() >= 2
+            && let Some(first) = siblings.iter().find(|id| self.tab_of(id).is_some())
+            && let Some(root) = self.tab_of_mut(first).map(|c| &mut c.root)
+        {
+            even_siblings(root, first);
+        }
+        out
     }
 
     /// Removes a tab. Returns its terminal addresses and whether its space closed.
@@ -1252,6 +1291,53 @@ mod tests {
         assert!(!m.toggle_zoom("x1"));
         assert_eq!(m.tab("c1").unwrap().zoomed, None);
         assert_eq!(m.focused_pane().as_deref(), Some("x1"));
+    }
+
+    #[test]
+    fn a_program_exiting_leaves_the_other_panes_equal() {
+        let mut m = model_with_one();
+        m.split("x1", Axis::Row, "x2", "t2");
+        m.split("x2", Axis::Row, "x3", "t3");
+        let weights = |m: &Model| -> Vec<f32> {
+            m.tab("c1").unwrap().root.children().iter().map(|n| match n.size {
+                Some(crate::layout::Size::Weight { weight }) => weight,
+                _ => 1.0,
+            }).collect()
+        };
+        // Three thirds with the middle one exiting (or parked): the two left
+        // share it evenly, as a hand's close slides them to.
+        m.remove_pane_evenly("x2");
+        assert_eq!(weights(&m), [1.0, 1.0]);
+    }
+
+    #[test]
+    fn closing_the_first_pane_evens_the_remaining_panes() {
+        let mut m = model_with_one();
+        m.split("x1", Axis::Row, "x2", "t2");
+        m.split("x2", Axis::Row, "x3", "t3");
+        m.remove_pane_evenly("x1");
+        let weights: Vec<f32> = m.tab("c1").unwrap().root.children().iter().map(|n| match n.size {
+            Some(crate::layout::Size::Weight { weight }) => weight,
+            _ => 1.0,
+        }).collect();
+        assert_eq!(weights, [1.0, 1.0], "closing the first pane shares its space between the two left");
+    }
+
+    #[test]
+    fn closing_a_nested_pane_keeps_the_grandparent_weight() {
+        let mut m = model_with_one();
+        let root = &mut m.tab_mut("c1").unwrap().root;
+        let mut x1 = root.find("x1").unwrap().clone();
+        x1.size = Some(crate::layout::Size::Weight { weight: 2.0 });
+        let mut col = Node::container("col", Axis::Column, vec![pane("x2", "t2"), pane("x3", "t3")]);
+        col.size = Some(crate::layout::Size::Weight { weight: 0.5 });
+        *root.children_mut().unwrap() = vec![x1, col];
+
+        m.remove_pane_evenly("x3");
+
+        let root = &m.tab("c1").unwrap().root;
+        assert_eq!(root.find("x1").and_then(|n| n.size), Some(crate::layout::Size::Weight { weight: 2.0 }), "the grandparent's other child keeps its weight");
+        assert_eq!(root.find("x2").and_then(|n| n.size), Some(crate::layout::Size::Weight { weight: 0.5 }), "the last child takes the collapsed column's slot size");
     }
 
     #[test]
