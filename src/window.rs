@@ -2752,7 +2752,7 @@ impl AppWindow {
     fn add_new_tab(&mut self, space: &str, tab: Tab, focus: bool) {
         if focus {
             self.model.add_tab(space, tab);
-            self.model.active = Some(space.to_owned());
+            self.model.show_space(space);
         } else {
             self.model.add_tab_unselected(space, tab);
         }
@@ -3220,7 +3220,7 @@ impl AppWindow {
                     self.model.spaces.get(i.checked_sub(1)?).map(|p| p.id.clone())
                 });
                 match id.filter(|id| self.model.space(id).is_some()) {
-                    Some(id) => self.model.active = Some(id),
+                    Some(id) => self.model.show_space(&id),
                     None => return self.fail("no such space"),
                 }
             }
@@ -3228,7 +3228,8 @@ impl AppWindow {
                 let n = self.model.spaces.len();
                 if let Some(i) = self.model.active_index().filter(|_| n > 0) {
                     let j = if name == "space.next" { (i + 1) % n } else { (i + n - 1) % n };
-                    self.model.active = Some(self.model.spaces[j].id.clone());
+                    let id = self.model.spaces[j].id.clone();
+                    self.model.show_space(&id);
                 }
             }
             // ---- tabs

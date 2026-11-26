@@ -40,6 +40,8 @@ pub struct Space {
     pub tabs: Vec<Tab>,
     /// The selected tab.
     pub active: Option<String>,
+    /// Tabs shown before, most recent last: closing the shown one goes back.
+    pub before: Vec<String>,
     /// Fields of its document entry this build doesn't read (a newer build's),
     /// written back as they were.
     pub rest: serde_json::Map<String, serde_json::Value>,
@@ -85,6 +87,8 @@ pub struct Model {
     pub spaces: Vec<Space>,
     /// The selected space.
     pub active: Option<String>,
+    /// Spaces shown before, most recent last: closing the shown one goes back.
+    pub before: Vec<String>,
     pub recent: Vec<Recent>,
     /// Each pane's live folder, for its display name.
     pub pane_folders: BTreeMap<String, String>,
@@ -102,6 +106,14 @@ pub fn priority(status: Option<&str>) -> u8 {
         Some("working") => 2,
         Some("idle") => 1,
         _ => 0,
+    }
+}
+
+fn push_recent(list: &mut Vec<String>, id: String) {
+    list.retain(|x| x != &id);
+    list.push(id);
+    if list.len() > 32 {
+        list.remove(0);
     }
 }
 
@@ -132,11 +144,8 @@ impl Tab {
             self.zoomed = Some(pane.to_owned());
         }
         if let Some(old) = self.focused.take().filter(|o| o != pane) {
-            self.before.retain(|p| *p != old && p != pane);
-            self.before.push(old);
-            if self.before.len() > 32 {
-                self.before.remove(0);
-            }
+            self.before.retain(|p| p != pane);
+            push_recent(&mut self.before, old);
         }
         self.focused = Some(pane.to_owned());
     }
@@ -164,8 +173,17 @@ impl Space {
 
     fn select(&mut self, ctx: &str) {
         if self.tab(ctx).is_some() {
-            self.active = Some(ctx.to_owned());
+            self.shown(ctx);
         }
+    }
+
+    /// Shows `ctx`, remembering the tab that was shown before it.
+    fn shown(&mut self, id: &str) {
+        if let Some(prev) = self.active.clone().filter(|prev| prev != id) {
+            push_recent(&mut self.before, prev);
+            self.before.retain(|t| t != id);
+        }
+        self.active = Some(id.to_owned());
     }
 }
 
@@ -221,6 +239,15 @@ impl Model {
     pub fn active_index(&self) -> Option<usize> {
         let id = self.active.as_deref()?;
         self.spaces.iter().position(|p| p.id == id).or((!self.spaces.is_empty()).then_some(0))
+    }
+
+    /// Shows a space, remembering the one shown before it.
+    pub fn show_space(&mut self, id: &str) {
+        if let Some(prev) = self.active.clone().filter(|prev| prev != id) {
+            push_recent(&mut self.before, prev);
+            self.before.retain(|s| s != id);
+        }
+        self.active = Some(id.to_owned());
     }
 
     pub fn active_space(&self) -> Option<&Space> {
@@ -299,10 +326,10 @@ impl Model {
     fn insert_space(&mut self, id: &str, name: &str, folder: &str, ctx: Tab, show: bool) {
         let show = show || self.active_index().is_none();
         let active = Some(ctx.id.clone());
-        self.spaces.push(Space { id: id.to_owned(), name: name.to_owned(), folder: folder.to_owned(), machine: None, tabs: vec![ctx], active, rest: Default::default() });
+        self.spaces.push(Space { id: id.to_owned(), name: name.to_owned(), folder: folder.to_owned(), machine: None, tabs: vec![ctx], active, before: Vec::new(), rest: Default::default() });
         self.recent.retain(|r| r.name != name);
         if show {
-            self.active = Some(id.to_owned());
+            self.show_space(id);
         }
     }
 
@@ -323,8 +350,9 @@ impl Model {
             return true;
         }
         let at = p.active.as_deref().and_then(|a| p.tabs.iter().position(|c| c.id == a)).map_or(p.tabs.len(), |i| i + 1);
-        p.active = Some(ctx.id.clone());
+        let id = ctx.id.clone();
         p.tabs.insert(at, ctx);
+        p.shown(&id);
         true
     }
 
@@ -429,8 +457,10 @@ impl Model {
         let ci = p.tabs.iter().position(|c| c.id == ctx).unwrap();
         let removed = p.tabs.remove(ci);
         if p.active.as_deref() == Some(ctx) {
-            // The tab that slides into the slot, or the last one.
-            p.active = p.tabs.get(ci).or(p.tabs.last()).map(|c| c.id.clone());
+            // The tab shown before it, else the one that slid into the slot, else the last.
+            p.active = p.before.iter().rev().find(|id| p.tabs.iter().any(|c| &c.id == *id)).cloned()
+                .or_else(|| p.tabs.get(ci).or(p.tabs.last()).map(|c| c.id.clone()));
+            p.before.retain(|id| id != ctx);
         }
         let closed = p.tabs.is_empty();
         if closed {
@@ -449,7 +479,10 @@ impl Model {
         self.recent.insert(0, Recent { name: p.name.clone(), folder: p.folder.clone() });
         self.recent.truncate(20);
         if was_active {
-            self.active = self.spaces.get(pi).or(self.spaces.last()).map(|p| p.id.clone());
+            // The space shown before it, else the one that slid into the slot, else the last.
+            self.active = self.before.iter().rev().find(|id| self.spaces.iter().any(|p| &p.id == *id)).cloned()
+                .or_else(|| self.spaces.get(pi).or(self.spaces.last()).map(|p| p.id.clone()));
+            self.before.retain(|id| id != &p.id);
         }
         p.tabs.iter().flat_map(|c| addresses(&c.root)).collect()
     }
@@ -462,8 +495,9 @@ impl Model {
     /// Selects a tab and its space. Shown again, a settled tab is back.
     pub fn select_tab(&mut self, ctx: &str) -> bool {
         let Some(p) = self.spaces.iter_mut().find(|p| p.tab(ctx).is_some()) else { return false };
+        let id = p.id.clone();
         p.select(ctx);
-        self.active = Some(p.id.clone());
+        self.show_space(&id);
         self.unsettle(ctx);
         true
     }
@@ -1019,6 +1053,41 @@ mod tests {
         assert_eq!(m.focused_pane().as_deref(), Some("x1"));
         // The arrangement keeps the tab's id with one pane left.
         assert_eq!(m.active_tab().unwrap().root.id, "c1");
+    }
+
+    #[test]
+    fn closing_the_shown_tab_goes_back_to_the_one_shown_before() {
+        let mut m = model_with_one();
+        m.add_tab("p1", Tab::new("c2", "docs", "x2", "t2"));
+        m.add_tab("p1", Tab::new("c3", "logs", "x3", "t3"));
+        m.select_tab("c1");
+        m.select_tab("c3");
+        m.remove_tab("c3");
+        assert_eq!(m.active_tab().map(|c| c.id.as_str()), Some("c1"));
+    }
+
+    #[test]
+    fn closing_the_shown_space_goes_back_to_the_one_shown_before() {
+        let mut m = Model::default();
+        m.add_space("p1", "api", "/a", Tab::new("c1", "one", "x1", "t1"));
+        m.add_space("p2", "web", "/b", Tab::new("c2", "two", "x2", "t2"));
+        m.add_space("p3", "logs", "/c", Tab::new("c3", "three", "x3", "t3"));
+        m.show_space("p1");
+        m.show_space("p3");
+        m.remove_space("p3");
+        assert_eq!(m.active.as_deref(), Some("p1"));
+    }
+
+    #[test]
+    fn more_than_thirty_two_switches_keep_the_most_recent_tab() {
+        let mut m = model_with_one();
+        for n in 2..=40 {
+            m.add_tab("p1", Tab::new(&format!("c{n}"), "", &format!("x{n}"), &format!("t{n}")));
+        }
+        assert_eq!(m.active_tab().map(|c| c.id.as_str()), Some("c40"));
+        assert_eq!(m.space("p1").unwrap().before.len(), 32, "only the most recent tabs stay");
+        m.remove_tab("c40");
+        assert_eq!(m.active_tab().map(|c| c.id.as_str()), Some("c39"), "the most recent tab comes back");
     }
 
     #[test]

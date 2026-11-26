@@ -45,6 +45,10 @@ fn empty_root() -> Node {
 pub struct View {
     active: Option<String>,
     spaces: BTreeMap<String, Option<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    before: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    space_before: BTreeMap<String, Vec<String>>,
     tabs: BTreeMap<String, TabView>,
     recent: Vec<Recent>,
     attention: BTreeMap<String, Seen>,
@@ -139,6 +143,7 @@ impl Document {
                     Tab { id: map(&t.id), name: t.name.clone(), root, focused: None, before: vec![], zoomed: None, settled: None, rest: t.rest.clone() }
                 })
                 .collect(),
+            before: Vec::new(),
             rest: s.rest.clone(),
         });
         model.spaces.splice(at..at, spaces);
@@ -151,9 +156,11 @@ impl View {
     pub fn capture(model: &Model) -> Self {
         Self {
             active: model.active.clone(),
-            recent: model.recent.clone(),
+            before: model.before.clone(),
             spaces: model.spaces.iter().map(|s| (s.id.clone(), s.active.clone())).collect(),
+            space_before: model.spaces.iter().filter(|s| !s.before.is_empty()).map(|s| (s.id.clone(), s.before.clone())).collect(),
             tabs: model.tabs().map(|t| (t.id.clone(), TabView { focused: t.focused.clone(), before: t.before.clone(), zoomed: t.zoomed.clone(), settled: t.settled })).collect(),
+            recent: model.recent.clone(),
             attention: model.agents.iter().map(|(a, s)| (a.clone(), Seen { word: s.word.clone(), seen: s.seen })).collect(),
         }
     }
@@ -166,6 +173,9 @@ impl View {
             if let Some(active) = self.spaces.get(&space.id) {
                 merged.spaces.insert(space.id.clone(), active.clone());
             }
+            if let Some(before) = self.space_before.get(&space.id) {
+                merged.space_before.insert(space.id.clone(), before.clone());
+            }
             for tab in &space.tabs {
                 if let Some(view) = self.tabs.get(&tab.id) {
                     merged.tabs.insert(tab.id.clone(), view.clone());
@@ -175,6 +185,9 @@ impl View {
                 merged.active = self.active.clone();
             }
         }
+        let mut before: Vec<String> = self.before.iter().filter(|id| !merged.before.contains(id)).cloned().collect();
+        before.extend(merged.before);
+        merged.before = before;
         for (address, seen) in &self.attention {
             if address.split_once('/').map(|(m, _)| m) == machine {
                 merged.attention.insert(address.clone(), seen.clone());
@@ -197,13 +210,21 @@ impl View {
     pub fn preserve_unloaded(&mut self, saved: &Self, loaded: impl Fn(Option<&str>) -> bool) {
         let unloaded = |id: &str| !loaded(id.split_once('/').map(|(m, _)| m));
         self.spaces.extend(saved.spaces.iter().filter(|(id, _)| unloaded(id)).map(|(id, v)| (id.clone(), v.clone())));
+        self.space_before.extend(saved.space_before.iter().filter(|(id, _)| unloaded(id)).map(|(id, v)| (id.clone(), v.clone())));
         self.tabs.extend(saved.tabs.iter().filter(|(id, _)| unloaded(id)).map(|(id, v)| (id.clone(), v.clone())));
+        let mut unloaded_before: Vec<String> = saved.before.iter()
+            .filter(|id| unloaded(id) && !self.before.contains(id))
+            .cloned()
+            .collect();
+        unloaded_before.append(&mut self.before);
+        self.before = unloaded_before;
         self.attention.extend(saved.attention.iter().filter(|(id, _)| unloaded(id)).map(|(id, v)| (id.clone(), v.clone())));
     }
 
     pub fn apply(&self, model: &mut Model) {
         for s in &mut model.spaces {
             s.active = self.spaces.get(&s.id).cloned().flatten().filter(|id| s.tab(id).is_some()).or_else(|| s.tabs.first().map(|t| t.id.clone()));
+            s.before = self.space_before.get(&s.id).map(|b| b.iter().filter(|id| s.tab(id).is_some()).cloned().collect()).unwrap_or_default();
             for t in &mut s.tabs {
                 if let Some(v) = self.tabs.get(&t.id) {
                     t.focused = v.focused.clone().filter(|id| t.root.find(id).is_some());
@@ -217,6 +238,7 @@ impl View {
             }
         }
         model.active = self.active.clone().filter(|id| model.space(id).is_some()).or_else(|| model.spaces.first().map(|s| s.id.clone()));
+        model.before = self.before.iter().filter(|id| model.space(id).is_some()).cloned().collect();
         model.recent = self.recent.clone();
         for (a, s) in &self.attention {
             model.agents.entry(a.clone()).or_insert_with(|| Agent { word: s.word.clone(), seen: s.seen, ..Default::default() });
@@ -233,6 +255,62 @@ mod tests {
         m.add_space("s", "work", "/work", Tab::new("t", "task", "p", "t1"));
         m
     }
+    #[test]
+    fn before_history_is_view_only_and_round_trips() {
+        let mut m = Model::default();
+        m.add_space("s1", "one", "/one", Tab::new("t1", "tab one", "p1", "a1"));
+        m.split("p1", Axis::Row, "p2", "a2");
+        m.add_tab("s1", Tab::new("t2", "tab two", "p3", "a3"));
+        m.select_tab("t1");
+        m.add_space("s2", "two", "/two", Tab::new("t3", "tab three", "p4", "a4"));
+        m.select_tab("t1");
+        let tab_before = m.tab("t1").unwrap().before.clone();
+        let space_before = m.space("s1").unwrap().before.clone();
+        let model_before = m.before.clone();
+
+        let doc = Document::capture(&m, None);
+        let doc_text = serde_json::to_string(&doc).unwrap();
+        assert!(!doc_text.contains("\"before\""), "pane and tab history stays out of the shared document: {doc_text}");
+        assert!(!doc_text.contains("space_before"), "space history stays out of the shared document: {doc_text}");
+
+        let view_text = serde_json::to_string(&View::capture(&m)).unwrap();
+        let view: View = serde_json::from_str(&view_text).unwrap();
+        m.before.clear();
+        m.space_mut("s1").unwrap().before.clear();
+        m.tab_mut("t1").unwrap().before.clear();
+        view.apply(&mut m);
+        assert_eq!(m.before, model_before);
+        assert_eq!(m.space("s1").unwrap().before, space_before);
+        assert_eq!(m.tab("t1").unwrap().before, tab_before);
+        assert_eq!(doc, Document::capture(&m, None), "the document still carries no view history");
+    }
+
+    #[test]
+    fn preserve_unloaded_keeps_remote_history_ahead_of_local_history() {
+        let mut saved = View::default();
+        saved.before = vec!["mac/old".into(), "mac/new".into(), "local-old".into()];
+        saved.space_before.insert("mac/s".into(), vec!["mac/t1".into(), "mac/t2".into()]);
+        saved.space_before.insert("local".into(), vec!["local-old-tab".into()]);
+        let mut view = View::default();
+        view.before = vec!["local-new".into()];
+        view.space_before.insert("local".into(), vec!["local-new-tab".into()]);
+
+        view.preserve_unloaded(&saved, |machine| machine != Some("mac"));
+
+        assert_eq!(view.before, ["mac/old", "mac/new", "local-new"], "unloaded history stays in order and before newer local history");
+        assert_eq!(view.space_before["mac/s"], ["mac/t1", "mac/t2"]);
+        assert_eq!(view.space_before["local"], ["local-new-tab"], "loaded history is not replaced");
+    }
+
+    #[test]
+    fn an_old_view_without_before_history_reads() {
+        let view: View = serde_json::from_value(serde_json::json!({
+            "active": null, "spaces": {}, "tabs": {}, "recent": [], "attention": {}
+        })).unwrap();
+        assert!(view.before.is_empty());
+        assert!(view.space_before.is_empty());
+    }
+
     #[test]
     fn focus_zoom_and_settle_are_private() {
         let mut m = model();
