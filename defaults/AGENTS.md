@@ -613,7 +613,7 @@ The main ones:
   toast with its exit code and last output lines. Or `tab.new {name?, space?, mod,
   props?, focus?}` for a tab whose only pane is a mod (a file, a board; split a shell
   in beside it like any tab), `tab.close {id?, confirmed?}` (closing the last tab
-  closes its space and asks first unless confirmed),
+  closes its space too; a script passes confirmed: true),
   `tab.rename {id?, name}` ("": its number again), `tab.move {id?, index | by}` (by: places left (-) or right (+), skipping settled tabs as `tab.next` does, wrapping),
   `tab.select {index | id}`, `tab.next`, `tab.prev`,
   `tab.settle {id?}`, `tab.unsettle {id?}` (index, next and prev

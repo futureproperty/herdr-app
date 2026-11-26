@@ -3195,15 +3195,11 @@ impl AppWindow {
             }
             "space.close" => {
                 let Some(id) = Self::owned(a, "id").or_else(|| self.model.active.clone()) else { return self.fail("no space to close") };
-                let Some(p) = self.model.space(&id) else { return self.fail(format!("no space {id:?}")) };
-                if a.get("confirmed").and_then(Value::as_bool) != Some(true) {
-                    if !person {
-                        return self.fail("space.close ends its terminals: pass confirmed: true");
-                    }
-                    let panes: usize = p.tabs.iter().map(|c| c.root.panes().len()).sum();
-                    let detail = format!("{} \u{2014} {} tabs, {} terminals", self.model.space_name(p, &home()), p.tabs.len(), panes);
-                    self.confirm("Close space?", &detail, "space.close", json!({ "id": id, "confirmed": true }), window, cx);
-                    return;
+                if self.model.space(&id).is_none() { return self.fail(format!("no space {id:?}")); }
+                // ctrl+d ends a shell without asking; a key, a click or a menu is no
+                // different. A script still says so explicitly.
+                if !person && a.get("confirmed").and_then(Value::as_bool) != Some(true) {
+                    return self.fail("space.close ends its terminals: pass confirmed: true");
                 }
                 let addrs = self.model.remove_space(&id);
                 self.close_terminals(addrs, cx);
@@ -3952,6 +3948,8 @@ impl AppWindow {
 
     // ---- overlays ----------------------------------------------------------
 
+    // Kept for upstream's callers; locally nothing asks before closing a space.
+    #[allow(dead_code)]
     fn confirm(&mut self, title: &str, detail: &str, command: &str, args: Value, window: &mut Window, cx: &mut Context<Self>) {
         let spec = json!({ "mod": "confirm", "kind": "dialog", "width": 380,
             "props": { "title": title, "detail": detail, "command": { "name": command, "args": args } } });
@@ -7138,6 +7136,39 @@ mod tests {
             assert_eq!(sizes(this), before);
             let r = this.run_as("pane.resize", json!({ "direction": "left" }), false, window, cx);
             assert!(r.get("error").is_none(), "the focused pane, with nothing beside it: nothing to move, {r}");
+        });
+    }
+
+    #[test]
+    fn closing_a_space_asks_nobody() {
+        in_own_process("space_close_no_dialog");
+    }
+
+    #[gpui::test]
+    fn space_close_no_dialog(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        if !running_alone("space_close_no_dialog") { return; }
+        let (view, cx) = open_window(cx, "unused", "", json!({
+            "id": "root", "type": "block", "content": { "tab": "active" }
+        }));
+        view.update_in(cx, |this, window, cx| {
+            this.model.add_space("sp1", "", "/tmp", crate::model::Tab::new("tb1", "", "p1", "t1"));
+            this.model.add_space("sp2", "", "/tmp", crate::model::Tab::new("tb2", "", "p2", "t2"));
+            this.documents.entry(String::new()).or_default().available = true;
+            this.sync(window, cx);
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        view.update_in(cx, |this, window, cx| {
+            let r = this.run_as("space.close", json!({ "id": "sp1" }), false, window, cx);
+            assert!(r.get("error").is_some(), "a script must still confirm: {r}");
+            assert!(this.model.space("sp1").is_some());
+            let r = this.run_as("tab.close", json!({ "id": "tb1" }), true, window, cx);
+            assert!(r.get("error").is_none(), "{r}");
+            assert!(this.model.space("sp1").is_none(), "the last tab took its space with it");
+            let r = this.run_as("space.close", json!({ "id": "sp2" }), true, window, cx);
+            assert!(r.get("error").is_none(), "{r}");
+            assert!(this.model.space("sp2").is_none());
+            assert!(this.overlays.is_empty(), "no dialog was opened: {:?}", this.overlays.iter().map(|o| o.id.clone()).collect::<Vec<_>>());
         });
     }
 

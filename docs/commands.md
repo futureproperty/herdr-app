@@ -33,7 +33,7 @@ Make a space: its name (default: none, so it's called after where its first term
 
 ## `space.close`
 
-Close a space and end its terminals (asks first unless confirmed).
+Close a space and end its terminals (a script passes confirmed: true).
 
 | Argument | Required |
 |---|---|
