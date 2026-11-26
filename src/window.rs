@@ -692,7 +692,6 @@ impl AppWindow {
                             if this.upgrade().is_none() {
                                 break;
                             }
-                            (**cx).update(crate::terminal::flush_output_clock);
                             let body = match crate::control::save_shot(
                                 cx.window_handle(),
                                 cx,
