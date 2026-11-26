@@ -468,7 +468,16 @@ impl Core {
     /// Starts a program in a new core terminal and returns its address (`tN`).
     /// Starts a terminal, here or on another machine (`on`: its name in `hc machine ls`).
     pub fn run(&self, argv: Vec<String>, cwd: Option<String>, labels: Value, on: Option<&str>, size: Option<(u16, u16)>, display: Value) -> Result<String> {
-        let env = json!({"TERM": "xterm-256color", "COLORTERM": "truecolor", "TERM_PROGRAM": "herdr"});
+        // `fish_handle_reflow` off: fish repaints its prompt on a resize so a
+        // reflowed long prompt is not left doubled, and its repaint lands a row
+        // below and blanks the old row in panes we resize for a slide, so the
+        // prompt visibly jumps. Terminal emulators reflow correctly themselves.
+        let env = json!({
+            "TERM": "xterm-256color",
+            "COLORTERM": "truecolor",
+            "TERM_PROGRAM": "herdr",
+            "fish_handle_reflow": "0",
+        });
         let mut params = json!({"argv": argv, "cwd": cwd, "env": env, "labels": labels, "on": on, "keep": true, "display": display});
         // Released cores ignore unknown parameters, including when forwarding to another machine.
         if let Some((cols, rows)) = size {
@@ -731,6 +740,7 @@ mod tests {
             assert_eq!(request["method"], "terminal.run");
             assert_eq!(request["params"]["size"], json!({"cols": 80, "rows": 24}));
             assert_eq!(request["params"]["display"], expected);
+            assert_eq!(request["params"]["env"]["fish_handle_reflow"], "0", "fish must not repaint its prompt on our resizes");
             routes.lock().unwrap().replies.remove(&request["id"].as_u64().unwrap()).unwrap()
                 .send(Ok(json!({"address": "t1"}))).unwrap();
         });
