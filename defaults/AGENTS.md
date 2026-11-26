@@ -616,6 +616,7 @@ The main ones:
   closes its space too; a script passes confirmed: true),
   `tab.rename {id?, name}` ("": its number again), `tab.move {id?, index | by}` (by: places left (-) or right (+), skipping settled tabs as `tab.next` does, wrapping),
   `tab.select {index | id}`, `tab.next`, `tab.prev`,
+  `tab.next_all`, `tab.prev_all`,
   `tab.settle {id?}`, `tab.unsettle {id?}` (index, next and prev
   skip settled tabs).
 - New spaces and tabs are shown at once. `focus: false` on `space.new` or

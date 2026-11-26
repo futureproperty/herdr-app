@@ -492,6 +492,31 @@ impl Model {
         self.active_tab()?.focused_pane()
     }
 
+    /// Shows the next (`dir` 1) or previous (-1) unsettled tab across spaces in
+    /// space order, wrapping at either end.
+    pub fn step_tab_all(&mut self, dir: i32) -> bool {
+        let flat: Vec<(usize, usize)> = self.spaces.iter().enumerate()
+            .flat_map(|(pi, p)| p.tabs.iter().enumerate()
+                .filter(|(_, c)| c.settled.is_none())
+                .map(move |(ti, _)| (pi, ti)))
+            .collect();
+        let n = flat.len();
+        if n == 0 { return false; }
+        let here = self.active_index().and_then(|pi| {
+            let p = &self.spaces[pi];
+            let active = p.active_tab()?;
+            active.settled.is_none().then(|| {
+                let ti = p.tabs.iter().position(|c| c.id == active.id)?;
+                Some((pi, ti))
+            })?
+        });
+        let i = here.and_then(|h| flat.iter().position(|x| *x == h)).unwrap_or(0);
+        let step = if dir >= 0 { 1 } else { -1 };
+        let (pi, ti) = flat[((i as i32 + step).rem_euclid(n as i32)) as usize];
+        let tab = self.spaces[pi].tabs[ti].id.clone();
+        self.select_tab(&tab)
+    }
+
     /// Selects a tab and its space. Shown again, a settled tab is back.
     pub fn select_tab(&mut self, ctx: &str) -> bool {
         let Some(p) = self.spaces.iter_mut().find(|p| p.tab(ctx).is_some()) else { return false };
@@ -740,6 +765,50 @@ pub fn space_json(m: &Model, p: &Space, index: usize, branch: Option<&str>, home
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_next_all_crosses_spaces_skips_settled_and_wraps() {
+        let mut m = Model::default();
+        m.add_space("p1", "a", "/a", Tab::new("c1", "one", "x1", "t1"));
+        m.add_space("p2", "b", "/b", Tab::new("c2", "two", "x2", "t2"));
+        m.add_tab("p2", Tab::new("c3", "three", "x3", "t3"));
+        m.select_tab("c1");
+        assert!(m.settle("c2", 1));
+        assert!(m.step_tab_all(1));
+        assert_eq!(m.active_tab().map(|t| t.id.as_str()), Some("c3"), "crosses into the next space and skips settled");
+        assert_eq!(m.active.as_deref(), Some("p2"));
+        assert!(m.step_tab_all(1));
+        assert_eq!(m.active_tab().map(|t| t.id.as_str()), Some("c1"), "wraps");
+        assert!(m.step_tab_all(-1));
+        assert_eq!(m.active_tab().map(|t| t.id.as_str()), Some("c3"), "wraps backward");
+    }
+
+    #[test]
+    fn a_tab_made_with_add_tab_is_where_stepping_starts() {
+        let mut m = Model::default();
+        m.add_space("p1", "a", "/a", Tab::new("c1", "one", "x1", "t1"));
+        m.add_tab("p1", Tab::new("c2", "two", "x2", "t2"));
+        m.select_tab("c2");
+        m.add_tab("p1", Tab::new("c3", "three", "x3", "t3"));
+        assert!(m.step_tab_all(1));
+        assert_eq!(m.active_tab().map(|t| t.id.as_str()), Some("c1"));
+        assert!(m.step_tab_all(-1));
+        assert_eq!(m.active_tab().map(|t| t.id.as_str()), Some("c3"));
+        assert!(m.step_tab_all(-1));
+        assert_eq!(m.active_tab().map(|t| t.id.as_str()), Some("c2"));
+    }
+
+    #[test]
+    fn settling_the_shown_tab_steps_from_the_one_it_hands_over_to() {
+        let mut m = Model::default();
+        m.add_space("p1", "a", "/a", Tab::new("c1", "one", "x1", "t1"));
+        m.add_tab("p1", Tab::new("c2", "two", "x2", "t2"));
+        m.add_tab("p1", Tab::new("c3", "three", "x3", "t3"));
+        m.select_tab("c2");
+        assert!(m.settle("c2", 1));
+        assert!(m.step_tab_all(-1));
+        assert_eq!(m.active_tab().map(|t| t.id.as_str()), Some("c1"));
+    }
 
     #[test]
     fn folders_name_as_in_herdr_on_every_system() {
