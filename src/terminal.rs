@@ -81,6 +81,8 @@ pub enum TerminalEvent {
     ContextMenu(Point<Pixels>),
     /// Something the person asked for failed: an error toast.
     Notice { title: String, body: String },
+    /// The terminal background changed, so framed chrome can follow it.
+    BackgroundChanged,
 }
 
 /// Rows of scrollback history as Ghostty's scrollbar reports them. `from_bottom`
@@ -123,6 +125,7 @@ struct Grid {
     vt_cell: (u32, u32),
     /// The colors and device-pixel cell size the core was last told.
     told_display: Option<DisplayFacts>,
+    last_bg: Option<Rgb>,
     /// Top-left of the cell grid in window coordinates, from the last paint.
     origin: Point<Pixels>,
     buttons_down: Vec<MouseButton>,
@@ -322,6 +325,7 @@ impl TerminalView {
                 scale: 1.0,
                 vt_cell: (9, 18),
                 told_display: None,
+                last_bg: None,
                 origin: Point::default(),
                 buttons_down: Vec::new(),
                 images: HashMap::new(),
@@ -648,6 +652,11 @@ impl TerminalView {
     /// Sizes a terminal that isn't on screen as its pane would be (`AppWindow::fit_hidden_tabs`).
     pub fn fit(&self, cols: u16, rows: u16, cell: Size<Pixels>, scale: f32) {
         self.grid.borrow_mut().fit(cols, rows, cell, scale);
+    }
+
+    /// The background the terminal itself shows (a program may set its own).
+    pub fn background(&self) -> Option<Rgb> {
+        self.grid.borrow().last_bg
     }
 
     pub fn on_screen_this_frame(&self) -> bool {
@@ -2105,20 +2114,76 @@ fn find_input_style() -> InputEditorStyle {
     }
 }
 
-fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, window: &mut Window, cx: &mut App) {
+/// The backdrop a terminal program paints most of its screen with, judged
+/// from a few widely spaced cells. Full-screen TUIs and their sidebars should
+/// tint the pane chrome, while a shell's sparse prompt colors should not.
+fn ground_bg(rows: &[Rc<Vec<vt::Cell>>], fallback: Rgb) -> Rgb {
+    let mut votes = [(Rgb(0, 0, 0), 0u8, 0u8); 5];
+    let mut used = 0;
+    let mut add = |color: Rgb, top: bool| {
+        if let Some(vote) = votes[..used].iter_mut().find(|vote| vote.0 == color) {
+            vote.1 += 1;
+            vote.2 += u8::from(top);
+        } else {
+            votes[used] = (color, 1, u8::from(top));
+            used += 1;
+        }
+    };
+
+    if let Some(row) = rows.first().filter(|row| !row.is_empty()) {
+        let right = row.len() - 1;
+        for x in [0, row.len() / 2, right] {
+            add(row[x].bg.unwrap_or(fallback), true);
+        }
+    }
+    if rows.len() >= 3 {
+        let row = &rows[rows.len() - 2];
+        if let Some(first) = row.first() {
+            add(first.bg.unwrap_or(fallback), false);
+        }
+        if let Some(last) = row.last() {
+            add(last.bg.unwrap_or(fallback), false);
+        }
+    }
+
+    let mut best = None;
+    let mut tied = false;
+    for vote in &votes[..used] {
+        match best {
+            None => {
+                best = Some(*vote);
+                tied = false;
+            }
+            Some(current) if (vote.1, vote.2) > (current.1, current.2) => {
+                best = Some(*vote);
+                tied = false;
+            }
+            Some(current) if (vote.1, vote.2) == (current.1, current.2) => tied = true,
+            Some(_) => {}
+        }
+    }
+    match best {
+        Some((color, count, _)) if count >= 2 && !tied => color,
+        _ => fallback,
+    }
+}
+
+fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, view: &WeakEntity<TerminalView>, window: &mut Window, cx: &mut App) {
     crate::bench::count(&crate::bench::GRID);
     let mut g = grid.borrow_mut();
     let cell = g.cell;
     let metrics = cell_metrics(window);
     let (pad_x, pad_y) = pad();
-    // Rows rarely fill the height exactly: split what's left above and below.
-    let spare = (f32::from(bounds.size.height) - 2.0 * pad_y - f32::from(cell.height) * g.vt.rows as f32).max(0.0);
     let scale = window.scale_factor();
     let snap = |v: Pixels| px((f32::from(v) * scale).round() / scale);
-    let origin = bounds.origin + point(px(pad_x), px(pad_y + (spare / 2.0).floor()));
+    let origin = bounds.origin + point(px(pad_x), px(pad_y));
     let origin = point(snap(origin.x), snap(origin.y));
     g.origin = origin;
     let frame = g.vt.frame();
+    let ground = ground_bg(&frame.rows, frame.bg);
+    let next_bg = Some(ground);
+    let changed = g.last_bg != next_bg;
+    g.last_bg = next_bg;
     let placements = g.vt.placements();
     let mut images: Vec<(bool, Bounds<Pixels>, Arc<RenderImage>)> = Vec::new();
     let mut keep = std::collections::HashSet::new();
@@ -2148,8 +2213,13 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
     let link_spans = g.link_spans.clone();
     let marked = g.marked.clone();
     drop(g);
+    if changed {
+        let bg_view = view.clone();
+        window.defer(cx, move |_, cx| {
+            let _ = bg_view.update(cx, |_, cx| cx.emit(TerminalEvent::BackgroundChanged));
+        });
+    }
 
-    window.paint_quad(fill(bounds, hsla(frame.bg).opacity(crate::settings::get().terminal_opacity)));
     let at = |x: usize, y: usize| origin + point(cell.width * x as f32, cell.height * y as f32);
     // Edges round to device pixels, so cells side by side meet without seams.
     let snap_box = |b: Bounds<Pixels>| {
@@ -2164,6 +2234,7 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
             }
         }
     };
+    window.paint_quad(fill(bounds, hsla(ground).opacity(crate::settings::get().terminal_opacity)));
     paint_images(true, window);
 
     // Each row's drawing is built once and painted again while the row is the
@@ -2195,7 +2266,7 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
     // Paint all program backgrounds first, then search overlays, then text.
     // This lets a match highlight sit below glyphs without contaminating
     // cached RowOps or the terminal's own selection/copy state.
-    for (y, (_, ops, _)) in painted.iter().enumerate() {
+    for (y, (row, ops, _)) in painted.iter().enumerate() {
         for op in ops {
             match op {
                 RowOp::Bg { from, to, color } => {
@@ -2204,6 +2275,13 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
                 }
                 _ => {}
             }
+        }
+        let right = origin.x + cell.width * row.len() as f32;
+        if right < bounds.right()
+            && let Some(bg) = row.last().and_then(|c| c.bg).filter(|bg| *bg != ground)
+        {
+            let b = Bounds::new(point(right, origin.y + cell.height * y as f32), size(bounds.right() - right, cell.height));
+            window.paint_quad(fill(b, hsla(bg)));
         }
     }
     for selected in [false, true] {
@@ -2612,7 +2690,7 @@ impl Render for TerminalView {
                         grid.borrow_mut().fit(cols, rows, cell, window.scale_factor());
                     },
                     move |bounds, _, window, cx| {
-                        paint_grid(bounds, &grid_paint, focused, window, cx);
+                        paint_grid(bounds, &grid_paint, focused, &selection_view, window, cx);
                         let view = selection_view.clone();
                         window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
                             if phase == DispatchPhase::Capture {
@@ -2793,8 +2871,95 @@ impl Focusable for TerminalView {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScrollTarget, pages_to_lines, scroll_target, scroll_state_changed};
+    use super::{ScrollTarget, ground_bg, pages_to_lines, scroll_target, scroll_state_changed};
+    use crate::vt::{Cell, Rgb};
     use serde_json::{Value, json};
+    use std::rc::Rc;
+
+    fn bg_row(backgrounds: &[Option<Rgb>]) -> Rc<Vec<Cell>> {
+        Rc::new(backgrounds.iter().map(|bg| Cell { bg: *bg, ..Default::default() }).collect())
+    }
+
+    #[test]
+    fn ground_bg_ignores_sparse_shell_prompt_colors() {
+        let (fallback, prompt) = (Rgb(5, 6, 7), Rgb(200, 30, 20));
+        let rows = [
+            bg_row(&[Some(prompt), None, None, None, Some(prompt)]),
+            bg_row(&[None; 5]),
+            bg_row(&[None; 5]),
+        ];
+        assert_eq!(ground_bg(&rows, fallback), fallback);
+    }
+
+    #[test]
+    fn ground_bg_finds_the_tui_background_below_a_badge() {
+        let (fallback, badge, tui) = (Rgb(5, 6, 7), Rgb(200, 30, 20), Rgb(10, 20, 30));
+        let rows = [
+            bg_row(&[Some(badge), Some(tui), Some(tui), Some(tui), Some(tui)]),
+            bg_row(&[Some(tui); 5]),
+            bg_row(&[Some(tui); 5]),
+        ];
+        assert_eq!(ground_bg(&rows, fallback), tui);
+    }
+
+    #[test]
+    fn ground_bg_prefers_the_main_canvas_over_a_sidebar() {
+        let (fallback, sidebar, canvas) = (Rgb(5, 6, 7), Rgb(20, 30, 40), Rgb(10, 20, 30));
+        let rows = [
+            bg_row(&[Some(sidebar), Some(canvas), Some(canvas), Some(canvas), Some(canvas)]),
+            bg_row(&[Some(sidebar), Some(canvas), Some(canvas), Some(canvas), Some(canvas)]),
+            bg_row(&[Some(sidebar), Some(canvas), Some(canvas), Some(canvas), Some(canvas)]),
+        ];
+        assert_eq!(ground_bg(&rows, fallback), canvas);
+    }
+
+    #[test]
+    fn ground_bg_prefers_a_full_top_bar() {
+        let (fallback, bar, body) = (Rgb(5, 6, 7), Rgb(20, 30, 40), Rgb(10, 20, 30));
+        let rows = [bg_row(&[Some(bar); 5]), bg_row(&[Some(body); 5]), bg_row(&[Some(body); 5])];
+        assert_eq!(ground_bg(&rows, fallback), bar);
+    }
+
+    #[test]
+    fn ground_bg_breaks_ties_by_top_row_then_falls_back() {
+        let fallback = Rgb(5, 6, 7);
+        let (red, blue, green) = (Rgb(200, 0, 0), Rgb(0, 0, 200), Rgb(0, 200, 0));
+        let top_row_tiebreak = [
+            bg_row(&[Some(red), Some(blue), Some(blue)]),
+            bg_row(&[Some(red), None, Some(green)]),
+            bg_row(&[None; 3]),
+        ];
+        assert_eq!(ground_bg(&top_row_tiebreak, fallback), blue);
+        let tied = [
+            bg_row(&[Some(red), Some(blue), Some(green)]),
+            bg_row(&[Some(red), None, Some(green)]),
+            bg_row(&[None; 3]),
+        ];
+        assert_eq!(ground_bg(&tied, fallback), fallback);
+        let all_distinct = [
+            bg_row(&[Some(Rgb(1, 0, 0)), Some(Rgb(0, 1, 0)), Some(Rgb(0, 0, 1))]),
+            bg_row(&[Some(Rgb(3, 0, 0)), None, Some(Rgb(0, 3, 0))]),
+            bg_row(&[None; 3]),
+        ];
+        assert_eq!(ground_bg(&all_distinct, fallback), fallback);
+    }
+
+    #[test]
+    fn ground_bg_handles_empty_and_short_screens() {
+        let fallback = Rgb(5, 6, 7);
+        let red = Rgb(200, 0, 0);
+        let blue = Rgb(0, 0, 200);
+        assert_eq!(ground_bg(&[], fallback), fallback);
+        assert_eq!(ground_bg(&[bg_row(&[])], fallback), fallback);
+        let one_row = [bg_row(&[Some(red), Some(red), Some(red)])];
+        assert_eq!(ground_bg(&one_row, fallback), red);
+        let two_rows = [bg_row(&[Some(red); 3]), bg_row(&[Some(blue); 3])];
+        assert_eq!(ground_bg(&two_rows, fallback), red, "only the top row is sampled below three rows");
+        let empty_middle = [bg_row(&[Some(red); 3]), bg_row(&[]), bg_row(&[None; 3])];
+        assert_eq!(ground_bg(&empty_middle, fallback), red);
+        let empty_top = [bg_row(&[]), bg_row(&[Some(blue); 3]), bg_row(&[None; 3])];
+        assert_eq!(ground_bg(&empty_top, fallback), blue);
+    }
 
     #[test]
     fn scroll_refreshes_only_when_leaving_or_reaching_end_or_alternate_screen() {
